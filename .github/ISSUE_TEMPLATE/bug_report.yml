@@ -1,0 +1,41 @@
+name: Bug report
+description: Report a reproducible FormatMaster problem
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: Do not post passwords, private files, or unredacted logs. Report security issues through SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: FormatMaster version
+      placeholder: v1.5.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Windows 11, Windows 10, macOS Apple Silicon, macOS Intel, Source build / Other]
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use a non-sensitive sample or describe its format and size.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized logs
+    validations:
+      required: true

@@ -1,0 +1,8 @@
+# 开发/构建依赖
+ruff>=0.6.0
+pyinstaller>=6.0.0
+pytest>=8.0.0
+# Starlette TestClient 的兼容 HTTP 客户端，保证 LAN 接口测试可正常收集
+httpx2>=2.0
+# 发布前依赖漏洞扫描（版本及传递依赖由 requirements.lock 固定）
+pip-audit>=2.9.0

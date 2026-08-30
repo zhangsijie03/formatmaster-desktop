@@ -1,0 +1,173 @@
+"""task_mixin — 面板任务提交/进度联动的通用混入。
+
+阶段2 起各转换面板共享同一套「文件列表 + TaskManager」联动逻辑：
+- _wire_tasks()：接入 TaskManager 信号
+- _submit_files()：公共校验 + 逐文件入队
+- _on_progress / _on_state / _cancel_all：进度、状态与按钮恢复
+混入方需提供：self.services / self.file_card / self.action_bar / self.out_row，
+并实现 _make_task(f) 返回入队 kwargs（name/task_type/output_path/runner 等）。
+"""
+import os
+
+from gui_qt import task_manager as tm
+from gui_qt.i18n import tr
+from gui_qt.components import toast
+from gui_qt.widgets import ActionStatusState, OutputDirRow
+
+
+class TaskPanelMixin:
+    """文件列表型转换面板的通用任务逻辑。"""
+
+    def _wire_tasks(self):
+        mgr = self.services.task_manager
+        mgr.sig_progress.connect(self._on_progress)
+        mgr.sig_state.connect(self._on_state)
+        self.action_bar.btn_go.clicked.connect(self._start)
+        self.action_bar.btn_cancel.clicked.connect(self._cancel_all)
+        self._task_rows = {}   # task_id -> (file_path, row)
+        self._batch_results = []
+        self._batch_progress = {}
+        self.file_card.files_changed.connect(self._sync_start_enabled)
+        self._sync_start_enabled()
+
+    # ── 子类实现 ─────────────────────────────────
+    def _make_task(self, f: str) -> dict:
+        """返回 mgr.add_task 的 kwargs（name/task_type/output_path/runner…）。"""
+        raise NotImplementedError
+
+    def _empty_hint(self) -> str:
+        return tr("请先添加要处理的文件", "Add files to process first")
+
+    # 是否需要 FFmpeg 就绪（加密/哈希等非 FFmpeg 功能设为 False，避免被拦）
+    need_ffmpeg = True
+
+    # ── 提交 ─────────────────────────────────────
+    def _submit_files(self):
+        """公共提交流程；成功入队至少 1 个任务返回 True。"""
+        files = self.file_card.files()
+        if not files:
+            toast.show_warning(self, self._empty_hint())
+            return False
+        if not self.need_ffmpeg or not self.services.ffmpeg_ready():
+            if self.need_ffmpeg:
+                toast.show_error(self, tr("FFmpeg 未就绪，请稍后重试", "FFmpeg not ready"))
+                return False
+        if self.out_row.mode() == OutputDirRow.MODE_CUSTOM and not self.out_row.path():
+            toast.show_warning(self, tr("请先选择自定义输出目录", "Choose an output folder first"))
+            return False
+
+        self.save_prefs()
+        mgr = self.services.task_manager
+        # 上一批已结束时开启新的结果统计，终态文案不能沿用上一批。
+        if not self._task_rows:
+            self._batch_results = []
+            self._batch_progress = {}
+        # 防重复提交：同一文件已有任务在队列/运行中时跳过，否则同一批
+        # 会出现重复任务，完成通知的任务数与文件行数对不上。
+        active_files = set()
+        for tid, (f, _row) in self._task_rows.items():
+            task = mgr.get_task(tid)
+            if task and task.state in (tm.WAITING, tm.RUNNING, tm.PAUSED):
+                active_files.add(f)
+        # 从偏好读取失败重试次数（设置中心可配置）
+        max_retries = int(self.services.get_pref("max_retries", 0) or 0)
+        added = 0
+        for f in files:
+            if f in active_files:
+                continue
+            kwargs = self._make_task(f)
+            if kwargs is None:
+                continue
+            kwargs.setdefault("max_retries", max_retries)
+            tid = mgr.add_task(**kwargs)
+            if tid is not None:
+                self._task_rows[tid] = (f, self.file_card.row_of_file(f))
+                self._batch_progress[tid] = 0
+                added += 1
+        if added:
+            self.action_bar.set_running(True)
+            self.action_bar.set_status(tr("已提交 {} 个任务", "Submitted {} tasks").format(added))
+            return True
+        if active_files & set(files):
+            # 全部是已在处理中的文件：不算失败，提示后等待完成即可
+            self.action_bar.set_status(
+                tr("文件已在处理中，已跳过", "Files already processing, skipped"),
+                ActionStatusState.WARNING)
+            return True
+        toast.show_error(self, tr("任务提交失败，请检查参数", "Submit failed, check settings"))
+        return False
+
+    def _cancel_all(self):
+        mgr = self.services.task_manager
+        for tid in list(self._task_rows):
+            mgr.cancel_task(tid)
+        self.action_bar.btn_cancel.setEnabled(False)
+
+    # ── 进度/状态联动 ────────────────────────────
+    def _on_progress(self, task_id, pct, msg, speed):
+        row = self._task_rows.get(task_id)
+        if not row:
+            return
+        _file, idx = row
+        # 文件列表可在运行时变化，按稳定路径定位当前行。
+        idx = self.file_card.row_of_file(_file)
+        # 终态后忽略迟到的进度信号
+        task = self.services.task_manager.get_task(task_id)
+        if task and task.state in (tm.SUCCESS, tm.FAILED, tm.CANCELLED):
+            return
+        if idx >= 0:
+            self.file_card.set_row_progress(idx, pct)
+        self._batch_progress[task_id] = max(0, min(100, int(pct)))
+        self.action_bar.set_status(msg)
+        self._update_total()
+
+    def _on_state(self, task_id, state):
+        row = self._task_rows.get(task_id)
+        if not row:
+            # 非本面板提交的任务：不弹通知（多个面板共享 TaskManager）
+            return
+        _file, idx = row
+        # 文件列表可在运行时变化，按稳定路径定位当前行。
+        idx = self.file_card.row_of_file(_file)
+        if idx >= 0 and state in (tm.SUCCESS, tm.FAILED, tm.CANCELLED):
+            # 终态：移除行内进度条，改为显示状态文字（成功/失败/取消）
+            self.file_card.set_row_progress(idx, -1,
+                                            tm.state_text(state))
+        if idx >= 0:
+            self.file_card.set_row_state(idx, tm.state_text(state))
+        task = self.services.task_manager.get_task(task_id)
+        # 单任务成功不再弹 toast：任务列表行内已显示「成功」状态字，
+        # app._on_batch_done 的「全部转换完成（N 个任务）」批量汇总已足够；
+        # 否则 N 个文件会弹 N+1 个成功通知，造成刷屏。
+        # 失败/取消则立即提示（用户需要立刻知道哪个出错/原因）。
+        if state == tm.FAILED and task:
+            toast.show_error(self,
+                             tr("处理失败：{}", "Failed: {}").format(os.path.basename(task.file_path)) +
+                             tr("（{}）", " ({})").format(task.error or tr("未知错误", "unknown error")))
+        if state in (tm.SUCCESS, tm.FAILED, tm.CANCELLED):
+            self._batch_progress[task_id] = 100
+            self._batch_results.append(state)
+            self._task_rows.pop(task_id, None)
+            self._update_total()
+        active = [self.services.task_manager.get_task(t)
+                  for t in self._task_rows]
+        if not any(t and t.state in (tm.WAITING, tm.RUNNING, tm.PAUSED)
+                   for t in active):
+            success = self._batch_results.count(tm.SUCCESS)
+            failed = self._batch_results.count(tm.FAILED)
+            cancelled = self._batch_results.count(tm.CANCELLED)
+            self.action_bar.set_batch_result(success, failed, cancelled)
+            self._sync_start_enabled()
+
+    def _update_total(self):
+        if not self._batch_progress:
+            return
+        self.action_bar.set_total(
+            sum(self._batch_progress.values()) // len(self._batch_progress))
+
+    def _sync_start_enabled(self):
+        """统一任务页主操作状态，避免空文件时仍显示可执行按钮。"""
+        enabled = bool(self.file_card.files()) and not self._task_rows
+        self.action_bar.btn_go.setEnabled(enabled)
+        self.action_bar.btn_go.setToolTip(
+            "" if enabled else self._empty_hint())

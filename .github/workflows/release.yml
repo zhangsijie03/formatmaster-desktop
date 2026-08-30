@@ -1,0 +1,483 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建的版本标签，例如 v1.4.8"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  YTDLP_VERSION: "2026.08.19"
+  YTDLP_MACOS_SHA256: "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202"
+  YTDLP_WINDOWS_SHA256: "66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a"
+  MACOS_FFMPEG_RELEASE: "b6.1.2-rc.1"
+  WINDOWS_FFMPEG_RELEASE: "autobuild-2026-08-30-13-12"
+  WINDOWS_FFMPEG_ASSET: "ffmpeg-n9.0.1-11-ge47273f4d9-win64-gpl-9.0.zip"
+  WINDOWS_FFMPEG_SHA256: "3c93cabd6aa5bcabd9f8f5e1a4711edbcb1f233c8cf78a672c286063009c5f6d"
+
+jobs:
+  verify-source:
+    name: 发布前源码验收
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      FORMATMASTER_OFFSCREEN: "1"
+    steps:
+      - name: 检出版本
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: 配置 Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 校验版本与发布说明
+        run: |
+          python scripts/release_preflight.py --tag "$RELEASE_TAG" --require-clean
+          VERSION="${RELEASE_TAG#v}"
+          NOTES="docs/releases/${RELEASE_TAG}.md"
+          grep -Eq 'SHA-256|SHA256' "$NOTES"
+
+      - name: 安装测试依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg libegl1
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.lock
+
+      - name: 执行发布门禁
+        run: |
+          python -m ruff check
+          python -m pytest -q
+
+  build-macos:
+    name: macOS ${{ matrix.arch }}
+    needs: verify-source
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14 是 Apple Silicon；macos-15-intel 用于 Intel 下载包。
+          - arch: arm64
+            runner: macos-14
+            binary_arch: arm64
+            ffmpeg_sha256: 9f865039102a1139c7057d7f21ddaacd106d602fa3af1f99b70f43d520439b8c
+            ffprobe_sha256: 05a26b32c32115785d48b01601e104712bbc6c2b1d363b9cf44c42232684e25e
+          - arch: x86_64
+            runner: macos-15-intel
+            binary_arch: x64
+            ffmpeg_sha256: e17cd7bcdecfb4b49d7614fd2c0ff1cd5f59616a556683942af4b075fcd659f0
+            ffprobe_sha256: ce5414269f0efa1e88b5e23b57f801d5b9a40be554716544936e0332b4601a62
+    permissions:
+      contents: read
+    steps:
+      - name: 检出版本
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: 配置 Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.lock
+
+      - name: 安装静态 FFmpeg 和 FFprobe
+        run: |
+          mkdir -p bin
+          BASE="https://github.com/descriptinc/ffmpeg-ffprobe-static/releases/download/${MACOS_FFMPEG_RELEASE}"
+          curl --fail --location --retry 3 --output bin/ffmpeg "$BASE/ffmpeg-darwin-${{ matrix.binary_arch }}"
+          curl --fail --location --retry 3 --output bin/ffprobe "$BASE/ffprobe-darwin-${{ matrix.binary_arch }}"
+          echo "${{ matrix.ffmpeg_sha256 }}  bin/ffmpeg" | shasum -a 256 --check
+          echo "${{ matrix.ffprobe_sha256 }}  bin/ffprobe" | shasum -a 256 --check
+          curl --fail --location --retry 3 --output bin/ffmpeg.LICENSE "$BASE/darwin-${{ matrix.binary_arch }}.LICENSE"
+          curl --fail --location --retry 3 --output bin/ffmpeg.README "$BASE/darwin-${{ matrix.binary_arch }}.README"
+          chmod +x bin/ffmpeg bin/ffprobe
+          ./bin/ffmpeg -version
+          ./bin/ffprobe -version
+
+      - name: 准备 yt-dlp
+        run: |
+          mkdir -p bin
+          curl --fail --location --retry 3 \
+            --output bin/yt-dlp \
+            "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp_macos"
+          echo "${YTDLP_MACOS_SHA256}  bin/yt-dlp" | shasum -a 256 --check
+          chmod +x bin/yt-dlp
+          ./bin/yt-dlp --version
+
+      - name: 执行 macOS 回归测试
+        env:
+          QT_QPA_PLATFORM: offscreen
+          FORMATMASTER_OFFSCREEN: "1"
+        run: |
+          python -m ruff check
+          python -m pytest -q
+
+      - name: 生成 macOS 第三方许可证清单与 SBOM
+        run: |
+          python scripts/generate_legal_artifacts.py \
+            --sbom "$RUNNER_TEMP/FormatMaster-${RELEASE_TAG#v}-macOS-${{ matrix.arch }}.spdx.json"
+
+      - name: 校验 macOS 正式签名配置
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          test -n "$MACOS_CERTIFICATE_BASE64"
+          test -n "$MACOS_CERTIFICATE_PASSWORD"
+          test -n "$MACOS_SIGN_IDENTITY"
+          test -n "$APPLE_ID"
+          test -n "$APPLE_TEAM_ID"
+          test -n "$APPLE_APP_PASSWORD"
+
+      - name: 安装 Developer ID 证书
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/formatmaster-build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security default-keychain -s "$KEYCHAIN_PATH"
+          {
+            echo "MACOS_KEYCHAIN_PATH=$KEYCHAIN_PATH"
+            echo "MACOS_KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      - name: 配置 Apple notarization
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          PROFILE_NAME="${MACOS_NOTARY_PROFILE:-FormatMasterNotary}"
+          xcrun notarytool store-credentials "$PROFILE_NAME" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD"
+          echo "MACOS_NOTARY_PROFILE=$PROFILE_NAME" >> "$GITHUB_ENV"
+
+      - name: 构建 macOS DMG
+        env:
+          FORMATMASTER_DIST: ${{ runner.temp }}/formatmaster-dist
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          if [ -n "${MACOS_SIGN_IDENTITY:-}" ] && [ -z "${MACOS_KEYCHAIN_PATH:-}" ]; then
+            echo "配置了 MACOS_SIGNING_IDENTITY，但没有 MACOS_CERTIFICATE_P12_BASE64"
+            exit 1
+          fi
+          # macOS 推荐 onedir：.app 本身就是发布边界，避免 PyInstaller
+          # 的 onefile + .app 兼容性警告和后续版本不兼容。
+          python build.py --dmg \
+            --sign-identity "$MACOS_SIGN_IDENTITY" \
+            --notarize-profile "$MACOS_NOTARY_PROFILE"
+
+      - name: 验证 DMG 并重命名
+        env:
+          FORMATMASTER_DIST: ${{ runner.temp }}/formatmaster-dist
+        run: |
+          DMG="$FORMATMASTER_DIST/格式大师-macOS.dmg"
+          VERSION="${RELEASE_TAG#v}"
+          test -f "$DMG"
+          hdiutil verify "$DMG"
+          MOUNT_POINT="$RUNNER_TEMP/formatmaster-dmg-mount"
+          mkdir -p "$MOUNT_POINT"
+          cleanup_dmg() { hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true; }
+          trap cleanup_dmg EXIT
+          hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MOUNT_POINT"
+          APP="$MOUNT_POINT/FormatMaster.app"
+          test -d "$APP"
+          test -e "$MOUNT_POINT/Applications"
+          test -f "$MOUNT_POINT/LICENSE"
+          test -f "$MOUNT_POINT/NOTICE"
+          test -f "$MOUNT_POINT/PRIVACY.md"
+          test -f "$MOUNT_POINT/SECURITY.md"
+          test -f "$MOUNT_POINT/THIRD_PARTY_NOTICES.md"
+          test -f "$MOUNT_POINT/THIRD_PARTY_LICENSES.md"
+          codesign --verify --deep --strict "$APP"
+          codesign --display --verbose=4 "$APP" 2>&1 | grep -F "Authority=Developer ID Application"
+          spctl --assess --type execute --verbose=2 "$APP"
+          xcrun stapler validate "$DMG"
+          BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c \
+            'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+          RELEASE_VERSION="$(/usr/libexec/PlistBuddy -c \
+            'Print :FormatMasterReleaseVersion' "$APP/Contents/Info.plist")"
+          test "$BUNDLE_VERSION" = "${VERSION%%-*}"
+          test "$RELEASE_VERSION" = "$VERSION"
+          TOOLS_DIR="$APP/Contents/Frameworks/bin"
+          test -x "$TOOLS_DIR/ffmpeg"
+          test -x "$TOOLS_DIR/ffprobe"
+          test -x "$TOOLS_DIR/yt-dlp"
+          "$APP/Contents/MacOS/FormatMaster" --self-test-package
+          hdiutil detach "$MOUNT_POINT"
+          trap - EXIT
+          OUTPUT="FormatMaster-${VERSION}-macOS-${{ matrix.arch }}.dmg"
+          mv "$DMG" "$RUNNER_TEMP/$OUTPUT"
+          echo "$RUNNER_TEMP/$OUTPUT" > "$RUNNER_TEMP/release-asset-path"
+
+      - name: 上传 macOS 构建产物
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: FormatMaster-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/FormatMaster-*.dmg
+            ${{ runner.temp }}/FormatMaster-*.spdx.json
+          if-no-files-found: error
+
+  build-windows:
+    name: Windows x64
+    needs: verify-source
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    steps:
+      - name: 检出版本
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: 配置 Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.lock
+
+      - name: 准备 FFmpeg 和 yt-dlp
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bin | Out-Null
+          $archive = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
+          $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/$env:WINDOWS_FFMPEG_RELEASE/$env:WINDOWS_FFMPEG_ASSET"
+          Invoke-WebRequest -Uri $ffmpegUrl -OutFile $archive
+          $ffmpegHash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($ffmpegHash -ne $env:WINDOWS_FFMPEG_SHA256) { throw "FFmpeg SHA-256 校验失败" }
+          $extract = Join-Path $env:RUNNER_TEMP "ffmpeg"
+          Expand-Archive -Path $archive -DestinationPath $extract -Force
+          $ffmpeg = Get-ChildItem $extract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          $ffprobe = Get-ChildItem $extract -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          if (-not $ffmpeg -or -not $ffprobe) { throw "FFmpeg/FFprobe 未找到" }
+          Copy-Item $ffmpeg.FullName bin/ffmpeg.exe -Force
+          Copy-Item $ffprobe.FullName bin/ffprobe.exe -Force
+          $ffmpegLicense = Get-ChildItem $extract -Recurse -Filter LICENSE.txt | Select-Object -First 1
+          if (-not $ffmpegLicense) { throw "FFmpeg 发布包缺少 LICENSE.txt" }
+          Copy-Item $ffmpegLicense.FullName bin/ffmpeg.LICENSE.txt -Force
+          $ytdlpUrl = "https://github.com/yt-dlp/yt-dlp/releases/download/$env:YTDLP_VERSION/yt-dlp.exe"
+          Invoke-WebRequest -Uri $ytdlpUrl -OutFile bin/yt-dlp.exe
+          $ytdlpHash = (Get-FileHash -Algorithm SHA256 bin/yt-dlp.exe).Hash.ToLowerInvariant()
+          if ($ytdlpHash -ne $env:YTDLP_WINDOWS_SHA256) { throw "yt-dlp SHA-256 校验失败" }
+          & bin/ffmpeg.exe -version
+          & bin/ffprobe.exe -version
+          & bin/yt-dlp.exe --version
+
+      - name: 记录 Windows 构建预检
+        shell: pwsh
+        run: |
+          $modules = @(
+            "PySide6", "qfluentwidgets", "rapid_table", "opencc",
+            "cryptography", "rapidocr_onnxruntime", "onnxruntime",
+            "pdf2docx", "reportlab", "pymupdf", "PIL"
+          )
+          $lines = foreach ($module in $modules) {
+            $found = python -c "import importlib.util; print(bool(importlib.util.find_spec('$module')))"
+            "$module=$found"
+          }
+          $lines | Set-Content -Encoding utf8 "$env:RUNNER_TEMP\formatmaster-windows-preflight.txt"
+          Get-Content "$env:RUNNER_TEMP\formatmaster-windows-preflight.txt"
+
+      - name: 执行 Windows 回归测试
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+          FORMATMASTER_OFFSCREEN: "1"
+        run: |
+          python -m ruff check
+          python -m pytest -q
+
+      - name: 生成 Windows 第三方许可证清单与 SBOM
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.TrimStart('v')
+          python scripts/generate_legal_artifacts.py `
+            --sbom "$env:RUNNER_TEMP\FormatMaster-$version-windows-x64.spdx.json"
+
+      - name: 构建 Windows 免安装包
+        env:
+          FORMATMASTER_DIST: ${{ runner.temp }}/formatmaster-dist
+        # Windows 也采用 onedir：避免 onefile 在包含 QtWebEngine、OCR 和
+        # PyMuPDF 等大型扩展时出现 CI 打包失败；最终仍以 ZIP 免安装分发。
+        shell: pwsh
+        run: |
+          $log = "$env:RUNNER_TEMP\formatmaster-windows-build.log"
+          & python -u build.py 2>&1 | Tee-Object -FilePath $log
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) { exit $exitCode }
+
+      - name: 上传 Windows 构建诊断
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: FormatMaster-windows-diagnostics
+          path: |
+            ${{ runner.temp }}/formatmaster-windows-preflight.txt
+            ${{ runner.temp }}/formatmaster-windows-build.log
+          if-no-files-found: ignore
+
+      - name: 签名并验证 Windows 主程序
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          FORMATMASTER_DIST: ${{ runner.temp }}/formatmaster-dist
+        run: |
+          if (-not $env:CERTIFICATE_BASE64 -or -not $env:CERTIFICATE_PASSWORD) {
+            throw "正式发布必须配置 Windows 代码签名证书"
+          }
+          $certificate = Join-Path $env:RUNNER_TEMP "formatmaster-signing.pfx"
+          [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+            -Recurse -Filter signtool.exe | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "找不到 signtool.exe" }
+          $exe = Join-Path $env:FORMATMASTER_DIST "dist\格式大师\格式大师.exe"
+          & $signtool.FullName sign /fd SHA256 /td SHA256 `
+            /tr http://timestamp.digicert.com /f $certificate /p $env:CERTIFICATE_PASSWORD $exe
+          if ($LASTEXITCODE -ne 0) { throw "Windows 代码签名失败" }
+          & $signtool.FullName verify /pa /v $exe
+          if ($LASTEXITCODE -ne 0) { throw "Windows 签名验证失败" }
+
+      - name: 打包 Windows ZIP
+        shell: pwsh
+        env:
+          FORMATMASTER_DIST: ${{ runner.temp }}/formatmaster-dist
+        run: |
+          $version = $env:RELEASE_TAG.TrimStart('v')
+          $stage = Join-Path $env:RUNNER_TEMP "FormatMaster-$version-windows-x64"
+          $appDir = Join-Path $env:FORMATMASTER_DIST "dist\格式大师"
+          $toolsDir = Join-Path $appDir "_internal\bin"
+          $requiredFiles = @(
+            (Join-Path $appDir "格式大师.exe"),
+            (Join-Path $toolsDir "ffmpeg.exe"),
+            (Join-Path $toolsDir "ffprobe.exe"),
+            (Join-Path $toolsDir "yt-dlp.exe")
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Windows 发布产物缺少必需文件：$file"
+            }
+          }
+          & (Join-Path $appDir "格式大师.exe") --self-test-package
+          if ($LASTEXITCODE -ne 0) { throw "Windows 发布包自检失败" }
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item $appDir "$stage\格式大师" -Recurse -Force
+          Copy-Item LICENSE, NOTICE, PRIVACY.md, SECURITY.md, THIRD_PARTY_NOTICES.md, THIRD_PARTY_LICENSES.md $stage -Force
+          $archive = Join-Path $env:RUNNER_TEMP "FormatMaster-$version-windows-x64-portable.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $archive -Force
+          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "Windows ZIP 未生成：$archive"
+          }
+
+      - name: 上传 Windows 构建产物
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: FormatMaster-windows-x64
+          path: |
+            ${{ runner.temp }}/FormatMaster-*-windows-x64-portable.zip
+            ${{ runner.temp }}/FormatMaster-*-windows-x64.spdx.json
+          if-no-files-found: error
+
+  publish:
+    name: 发布 GitHub Release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: 检出版本说明
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: release-assets
+
+      - name: 生成校验文件
+        run: |
+          mkdir -p release-assets-flat
+          # 诊断 artifact 只用于排障，禁止混入公开 Release 资产和校验文件。
+          find release-assets -type f \( -name '*.dmg' -o -name '*-windows-x64-portable.zip' -o -name '*.spdx.json' \) -exec cp {} release-assets-flat/ \;
+          cd release-assets-flat
+          VERSION="${RELEASE_TAG#v}"
+          test -f "FormatMaster-${VERSION}-macOS-arm64.dmg"
+          test -f "FormatMaster-${VERSION}-macOS-x86_64.dmg"
+          test -f "FormatMaster-${VERSION}-windows-x64-portable.zip"
+          test -f "FormatMaster-${VERSION}-macOS-arm64.spdx.json"
+          test -f "FormatMaster-${VERSION}-macOS-x86_64.spdx.json"
+          test -f "FormatMaster-${VERSION}-windows-x64.spdx.json"
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 生成 GitHub 构建溯源证明
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: release-assets-flat/*
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="docs/releases/${RELEASE_TAG}.md"
+          test -f "$NOTES"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG 已存在；禁止覆盖不可变发布资产"
+            exit 1
+          fi
+          prerelease_args=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            prerelease_args+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" release-assets-flat/* \
+            --title "FormatMaster ${RELEASE_TAG}" \
+            --notes-file "$NOTES" \
+            --verify-tag "${prerelease_args[@]}"

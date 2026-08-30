@@ -1,0 +1,227 @@
+"""mediainfo — 媒体文件详细信息检测（MediaInfo 风格）。
+
+用 ffprobe 读取容器格式、编码器、分辨率、帧率、码率、时长、
+音视频流等字段，返回分节键值对列表供 UI 展示。
+"""
+
+import math
+import os
+
+from core.ffmpeg_executor import get_ffprobe_raw
+
+
+def _fmt_size(n):
+    try:
+        n = int(n)
+    except (TypeError, ValueError, OverflowError):
+        return "--"
+    if n <= 0:
+        return "--"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _fmt_ratio(r):
+    """'30000/1001' → '29.97 fps'；非分数原样返回。"""
+    if not r:
+        return "--"
+    r = str(r).strip()
+    if "/" in r:
+        try:
+            a, b = r.split("/", 1)
+            denominator = float(b)
+            if denominator == 0:
+                return "--"
+            value = float(a) / denominator
+        except (ValueError, ZeroDivisionError):
+            return "--"
+    else:
+        try:
+            value = float(r)
+        except ValueError:
+            return "--"
+    if not math.isfinite(value) or value <= 0:
+        return "--"
+    return f"{value:.3f}".rstrip("0").rstrip(".") + " fps"
+
+
+def _fmt_brate(b):
+    if not b:
+        return "--"
+    try:
+        v = int(b)
+    except (TypeError, ValueError, OverflowError):
+        return str(b)
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.2f} Mbps"
+    if v >= 1000:
+        return f"{v / 1000:.0f} kbps"
+    return f"{v} bps"
+
+
+def _fmt_dur(sec):
+    try:
+        sec = float(sec)
+    except (TypeError, ValueError, OverflowError):
+        return "--"
+    if not math.isfinite(sec) or sec <= 0:
+        return "--"
+    h = int(sec // 3600)
+    m = int(sec % 3600 // 60)
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:05.2f}"
+
+
+def _fmt_channels(s):
+    ch = s.get("channels")
+    layout = s.get("channel_layout")
+    if ch:
+        if layout:
+            return f"{ch} ({layout})"
+        return str(ch)
+    return layout or "--"
+
+
+def get_mediainfo(path):
+    """读取媒体详细信息 → 分节列表 [(节名, [(字段, 值), ...]), ...]。
+
+    失败返回 None。
+    """
+    if not os.path.isfile(path):
+        return None
+    raw = get_ffprobe_raw(path)
+    if not raw or not raw.get("streams"):
+        return None
+    fmt = raw.get("format", {})
+    sections = []
+
+    fsec = []
+    tags = fmt.get("tags", {})
+    if tags.get("title"):
+        fsec.append(("标题", tags["title"]))
+    try:
+        actual_size = os.path.getsize(path)
+    except OSError:
+        actual_size = None
+    fsec += [
+        ("容器格式", fmt.get("format_long_name")
+         or fmt.get("format_name") or "--"),
+        ("文件大小", _fmt_size(fmt.get("size") or actual_size)),
+        ("时长", _fmt_dur(fmt.get("duration"))),
+        ("总码率", _fmt_brate(fmt.get("bit_rate"))),
+    ]
+    if tags.get("encoder"):
+        fsec.append(("编码软件", tags["encoder"]))
+    sections.append(("文件", fsec))
+
+    streams = raw.get("streams", [])
+    stream_counts = {"video": 0, "audio": 0, "subtitle": 0, "data": 0}
+    for s in streams:
+        stags = s.get("tags", {})
+        t = s.get("codec_type")
+        if t in stream_counts:
+            stream_counts[t] += 1
+        stream_number = stream_counts.get(t, 0)
+        if t == "video":
+            width, height = s.get("width"), s.get("height")
+            resolution = f"{width}×{height}" if width and height else "--"
+            vsec = [
+                ("编码器", s.get("codec_long_name") or s.get("codec_name") or "--"),
+            ]
+            profile = s.get("profile")
+            if profile:
+                vsec.append(("规格", profile))
+            vsec += [
+                ("分辨率", resolution),
+                ("像素格式", s.get("pix_fmt") or "--"),
+                ("帧率", _fmt_ratio(s.get("avg_frame_rate")
+                                    or s.get("r_frame_rate"))),
+                ("码率", _fmt_brate(s.get("bit_rate"))),
+                ("色彩空间", s.get("color_space") or "--"),
+                ("色彩传输", s.get("color_transfer") or "--"),
+                ("位深", s.get("bits_per_raw_sample")
+                 or s.get("bits_per_sample") or "--"),
+            ]
+            lang = stags.get("language")
+            if lang:
+                vsec.append(("语言", lang))
+            sections.append((f"视频流 {stream_number}", vsec))
+        elif t == "audio":
+            asec = [
+                ("编码器", s.get("codec_long_name") or s.get("codec_name") or "--"),
+                ("采样率", (f"{s.get('sample_rate')} Hz"
+                            if s.get("sample_rate") else "--")),
+                ("声道", _fmt_channels(s)),
+                ("位深", s.get("bits_per_sample") or "--"),
+                ("码率", _fmt_brate(s.get("bit_rate"))),
+                ("语言", stags.get("language") or "--"),
+            ]
+            sections.append((f"音频流 {stream_number}", asec))
+        elif t == "subtitle":
+            sections.append((f"字幕流 {stream_number}", [
+                ("编码器", s.get("codec_long_name") or s.get("codec_name") or "--"),
+                ("语言", stags.get("language") or "--"),
+            ]))
+        elif t == "data":
+            sections.append((f"数据流 {stream_number}", [
+                ("类型", s.get("codec_name") or "--"),
+            ]))
+    return sections
+
+
+def get_bitrate_samples(path, max_seconds=600):
+    """逐秒码率采样（视频质量分析，2026-08-19 新增）。
+
+    用 ffprobe -show_packets 统计视频流每个包（dts_time + size），
+    按整秒分桶累加 → 每秒 kbps 曲线。返回：
+      (samples_kbps, duration_sec, avg_kbps, peak_kbps) 或 None（失败/无视频流）。
+
+    max_seconds：超过该时长的视频只统计前 N 秒（长片采样足够判断质量，
+    避免超大文件输出爆炸）。
+    """
+    import subprocess
+    from utils.config import get_ffprobe_path
+    ffprobe = get_ffprobe_path()
+    if not ffprobe:
+        return None
+    cmd = [ffprobe, "-v", "error",
+           "-select_streams", "v:0",
+           "-show_entries", "packet=dts_time,size",
+           "-of", "csv=p=0", path]
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", timeout=30,
+            creationflags=(subprocess.CREATE_NO_WINDOW
+                           if os.name == "nt" else 0))
+    except Exception:  # noqa: BLE001
+        return None
+    if proc.returncode != 0:
+        return None
+
+    buckets = {}
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            ts = float(parts[0])
+            size = int(parts[1])
+        except ValueError:
+            continue
+        if ts < 0 or ts >= max_seconds:
+            continue
+        b = int(ts)
+        buckets[b] = buckets.get(b, 0) + size
+
+    if not buckets:
+        return None
+    duration = max(buckets.keys()) + 1
+    samples = [buckets.get(i, 0) * 8 / 1024.0 for i in range(duration)]
+    total_bits = sum(buckets.values()) * 8
+    avg = total_bits / 1024.0 / duration if duration else 0
+    peak = max(samples)
+    return samples, duration, round(avg, 1), round(peak, 1)

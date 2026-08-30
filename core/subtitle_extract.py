@@ -1,0 +1,312 @@
+# -*- coding: utf-8 -*-
+"""subtitle_extract — 视频硬字幕提取（OCR → .srt）。
+
+流程：FFmpeg 按固定帧率抽帧 → RapidOCR 逐帧识别 → 相邻帧文本去重合并 →
+生成标准 .srt 字幕文件。适合外语视频、录播课等硬字幕场景。
+"""
+import glob
+import math
+import os
+import re
+import shutil
+import tempfile
+
+from utils.config import get_ffmpeg_path
+from core.ffmpeg_executor import get_ffprobe_raw
+from core.ffmpeg_progress import run_ffmpeg
+
+SRT_TEMPLATE = "{idx}\n{start} --> {end}\n{text}\n\n"
+
+
+def _duration_of(video):
+    try:
+        info = get_ffprobe_raw(video, timeout=10)
+        if info and "format" in info:
+            return float(info["format"].get("duration", 0))
+    except Exception:
+        pass
+    return 0
+
+
+def _normalize(text):
+    """去除空白与标点，用于相邻帧文本比较。"""
+    return re.sub(r"[\s\u3000，。！？、；：,.!?;:()（）\"'“”‘’\-]", "", text)
+
+
+def _fmt_ts(sec):
+    """秒 → SRT 时间戳 HH:MM:SS,mmm。"""
+    sec = max(0, sec)
+    ms = int(round((sec - int(sec)) * 1000))
+    if ms >= 1000:
+        sec += 1
+        ms -= 1000
+    h, rem = divmod(int(sec), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _extract_frames(video, tmp_dir, fps, duration=0, progress_cb=None,
+                    cancel_check=None):
+    """ffmpeg 抽帧到临时目录，返回排序后的帧路径列表。"""
+    ffmpeg = get_ffmpeg_path()
+    if not ffmpeg:
+        if progress_cb:
+            progress_cb(-1, "错误: FFmpeg 未安装")
+        return None
+    pattern = os.path.join(tmp_dir, "frame_%05d.png")
+    cmd = [ffmpeg, "-y", "-i", video, "-vf", f"fps={fps}",
+           "-q:v", "2", pattern]
+
+    def _report_extract_progress(pct, message):
+        """抽帧只占整条 OCR 流程的 5%~30%，避免阶段切换时进度倒退。"""
+        if not progress_cb:
+            return
+        scaled = pct if pct < 0 else 5 + int(max(0, min(100, pct)) * 0.25)
+        progress_cb(scaled, message)
+
+    try:
+        result = run_ffmpeg(cmd, duration=duration, label="抽帧",
+                            cancel_check=cancel_check,
+                            progress_callback=_report_extract_progress,
+                            translate_error=True)
+        if not result.success:
+            if result.cancelled:
+                raise InterruptedError("已取消")
+            if progress_cb:
+                progress_cb(-1, f"抽帧失败: {result.error_cn or 'FFmpeg 执行失败'}")
+            return None
+    except InterruptedError:
+        raise
+    except Exception as e:
+        if progress_cb:
+            progress_cb(-1, f"抽帧失败：{e}")
+        return None
+    frames = sorted(glob.glob(os.path.join(tmp_dir, "frame_*.png")))
+    if not frames:
+        if progress_cb:
+            progress_cb(-1, "未抽到任何帧（视频可能损坏或过短）")
+        return None
+    return frames
+
+
+def detect_subtitle_band(frame_path, scan_ratio=0.7, min_band=0.02):
+    """自动检测字幕条带位置（亮度分析）。
+
+    字幕通常为"半透明黑底条 + 白字"，位于画面下部/中部：
+    扫描下半 70% 画面，逐行统计暗像素比例（底条）与亮像素比例（文字），
+    同时满足的连续行带即字幕区。返回 (top_ratio, bottom_ratio)（0~1），
+    未检测到返回 None（调用方回退手动区域）。
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+        with Image.open(frame_path) as _f:
+            arr = np.asarray(_f.convert("L"))
+    except Exception:
+        return None
+    h, w = arr.shape
+    if h < 40:
+        return None
+    scan_top = int(h * (1 - scan_ratio))
+    dark = (arr < 80)
+    bright = (arr > 200)
+    row_dark = dark.mean(axis=1)
+    row_bright = bright.mean(axis=1)
+    # 字幕行：同时含一定暗像素（底条）与亮像素（文字）
+    band_mask = (row_dark > 0.06) & (row_bright > 0.005)
+    best = None
+    cur_start = None
+    cur_len = 0
+    for y in range(scan_top, h):
+        if band_mask[y]:
+            if cur_start is None:
+                cur_start = y
+            cur_len += 1
+            if best is None or cur_len > best[2]:
+                best = (cur_start, y, cur_len)
+        else:
+            cur_start = None
+            cur_len = 0
+    min_rows = max(6, int(h * min_band))
+    if best and best[2] >= min_rows:
+        return best[0] / h, best[1] / h
+    return None
+
+
+def _crop_box(img, region, height, band):
+    """按 region/height 或自动检测 band 计算裁剪框 (left, top, right, bottom)。"""
+    w, h = img.size
+    if band is not None:
+        return (0, int(band[0] * h), w, int(band[1] * h))
+    if region == "full":
+        return (0, 0, w, h)
+    if region == "top":
+        return (0, 0, w, int(h * height))
+    return (0, int(h * (1 - height)), w, h)
+
+
+def _ocr_frames(frames, fps, lang, region="bottom", height=0.15, band=None,
+                progress_cb=None, cancel_check=None):
+    """逐帧 OCR，返回 [(start_sec, end_sec, text), ...]（已合并相邻相同文本）。
+
+    region: "bottom" 只识别画面底部字幕区（默认，避免误提屏幕上 UI 文字）、
+            "top" 顶部、"full" 全屏（会连屏幕上的其他文字一起识别）。
+    height: bottom/top 模式的裁剪高度比例（0.05~0.4，默认 0.15）。
+    band: 自动检测到的字幕条带 (top_ratio, bottom_ratio)，优先于 region/height。
+    """
+    try:
+        from core.ocr_tool import _get_engine
+        engine = _get_engine()
+    except Exception as ex:  # noqa: BLE001 - 转成用户可理解的任务错误
+        if progress_cb:
+            progress_cb(-1, f"OCR 引擎不可用：{ex}")
+        return None
+    from PIL import Image
+    import numpy as np
+    total = len(frames)
+    entries = []
+    cur_text = ""
+    cur_start = 0.0
+    cur_end = 0.0
+    failed_frames = 0
+    first_error = ""
+    try:
+        height = max(0.05, min(0.4, float(height or 0.15)))
+    except (TypeError, ValueError):
+        height = 0.15
+
+    for i, fp in enumerate(frames):
+        if cancel_check and cancel_check():
+            return None
+        start = i / fps
+        end = (i + 1) / fps
+        text = ""
+        try:
+            with Image.open(fp) as _f:
+                img = _f.convert("RGB")
+            img = img.crop(_crop_box(img, region, height, band))
+            # 小字幕区放大后再 OCR（提升小字号识别率）
+            if img.height < 120:
+                ratio = 240 / img.height
+                img = img.resize((int(img.width * ratio), int(img.height * ratio)),
+                                 Image.LANCZOS)
+            arr = np.asarray(img)
+            img.close()
+            result, _ = engine(arr)
+            if result:
+                text = "\n".join(item[1] for item in result).strip()
+        except Exception as ex:  # noqa: BLE001 - 单帧损坏不应中断整段视频
+            failed_frames += 1
+            if not first_error:
+                first_error = str(ex)
+            text = ""
+
+        if progress_cb:
+            progress_cb(int(30 + (i + 1) / total * 60), f"识别字幕 {i+1}/{total}…")
+
+        if _normalize(text) == _normalize(cur_text) and text:
+            # 与上一帧相同 → 延长结束时间
+            cur_end = end
+        else:
+            if cur_text:
+                entries.append((cur_start, cur_end, cur_text))
+            cur_text = text
+            cur_start = start
+            cur_end = end
+
+    if failed_frames == total:
+        if progress_cb:
+            progress_cb(-1, f"OCR 识别失败：{first_error or '无法读取视频帧'}")
+        return None
+    if cur_text:
+        entries.append((cur_start, cur_end, cur_text))
+    return entries
+
+
+def extract_subtitles(video, output_path, fps=1, lang="chi_sim+eng",
+                      region="bottom", height=0.15, auto_detect=False,
+                      progress_cb=None, cancel_check=None, tmp_dir=None):
+    """提取视频硬字幕为 .srt 文件，返回是否成功。
+
+    fps: 抽帧率（每秒多少帧），越大字幕时间轴越精确但 OCR 更慢（默认 1）。
+    region: 字幕识别区域——"bottom"（底部，默认，避免误提屏幕 UI 文字）/
+            "top"（顶部）/"full"（全屏，可能连屏幕其他文字一起提取）。
+    height: bottom/top 模式的裁剪高度比例（默认 0.15=底部 15%）。
+    auto_detect: 自动检测字幕条带位置（亮度分析），检测成功优先于 region/height。
+    tmp_dir: 临时目录，默认系统 temp（自动创建/清理）。
+    """
+    if not os.path.isfile(video):
+        if progress_cb:
+            progress_cb(-1, "找不到视频文件")
+        return False
+    try:
+        fps = float(fps)
+        height = float(height)
+    except (TypeError, ValueError):
+        if progress_cb:
+            progress_cb(-1, "字幕识别参数无效")
+        return False
+    if not math.isfinite(fps) or fps <= 0 or region not in {
+            "bottom", "top", "full"} or not math.isfinite(height) \
+            or not 0.05 <= height <= 1:
+        if progress_cb:
+            progress_cb(-1, "字幕识别参数无效")
+        return False
+    duration = _duration_of(video)
+    if duration <= 0:
+        if progress_cb:
+            progress_cb(-1, "无法读取视频时长")
+        return False
+
+    # 即使调用方提供临时目录，每次任务仍创建独立子目录，避免上次残留帧
+    # 混入当前 OCR；任务结束统一回收该子目录。
+    if tmp_dir is not None:
+        os.makedirs(tmp_dir, exist_ok=True)
+    work_dir = tempfile.mkdtemp(prefix="fm_sub_", dir=tmp_dir)
+    try:
+        if progress_cb:
+            progress_cb(5, "抽取视频帧…")
+        frames = _extract_frames(video, work_dir, fps, duration,
+                                 progress_cb, cancel_check)
+        if frames is None:
+            return False
+        if cancel_check and cancel_check():
+            return False
+        band = None
+        if auto_detect:
+            if progress_cb:
+                progress_cb(15, "检测字幕区域…")
+            # 用中间帧检测字幕条带；失败回退手动区域
+            mid = frames[len(frames) // 2]
+            band = detect_subtitle_band(mid)
+        entries = _ocr_frames(frames, fps, lang, region, height,
+                              band, progress_cb, cancel_check)
+        if entries is None:
+            return False
+        if not entries:
+            if progress_cb:
+                progress_cb(-1, "未识别到字幕文字（视频可能无硬字幕）")
+            return False
+
+        if progress_cb:
+            progress_cb(95, "生成字幕文件…")
+        output_parent = os.path.dirname(os.path.abspath(output_path))
+        os.makedirs(output_parent, exist_ok=True)
+        fd, staged_output = tempfile.mkstemp(
+            prefix=".formatmaster-subtitle-", suffix=".srt",
+            dir=output_parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                for idx, (start, end, text) in enumerate(entries, 1):
+                    stream.write(SRT_TEMPLATE.format(
+                        idx=idx, start=_fmt_ts(start), end=_fmt_ts(end),
+                        text=text))
+            os.replace(staged_output, output_path)
+        finally:
+            if os.path.exists(staged_output):
+                os.remove(staged_output)
+        if progress_cb:
+            progress_cb(100, f"完成，共 {len(entries)} 条字幕")
+        return True
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)

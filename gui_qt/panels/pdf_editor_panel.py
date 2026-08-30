@@ -1,0 +1,726 @@
+"""pdf_editor_panel — PDF 可视化编辑面板（阶段3 迁移自 gui/pdf_editor_panel.py）。
+
+缩略图网格（QListWidget IconMode）+ Ctrl/Shift 多选 + 拖拽排序，
+页面操作工具栏：旋转/删除/复制/插入PDF/插入图片/空白页/水印/页码/元数据/撤销。
+业务全部复用 core.pdf_editor.PdfEditor；缩略图由后台线程渲染，
+用 _render_gen 代数守卫防止过期结果回填。
+"""
+import os
+
+from PySide6.QtCore import QSize, Qt, QThread, Signal
+from gui_qt.components.safe_worker import SafeWorker
+from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtWidgets import (QAbstractItemView, QFileDialog,
+                               QFormLayout, QHBoxLayout, QListWidget,
+                               QListWidgetItem, QSizePolicy, QVBoxLayout, QWidget)
+from qfluentwidgets import (FluentIcon, CaptionLabel, ComboBox, FlowLayout, LineEdit,
+                            MessageBox, PrimaryPushButton, PushButton,
+                            SpinBox)
+
+from gui_qt.i18n import tr
+from gui_qt.components import design_system as ds
+
+from core.pdf_editor import PdfEditor
+from gui_qt.components import toast
+from gui_qt.components.card import Card
+from gui_qt.components.dialog import FluentDialogBase
+from gui_qt.components.empty_state import EmptyState
+from gui_qt.components.page_header import PageHeader
+from gui_qt.panels.base_panel import BaseQtPanel
+
+THUMB_W = 150
+THUMB_H = 200
+
+
+def _pil_to_pixmap(pil_img):
+    """PIL.Image → QPixmap（主线程调用）。"""
+    from PIL.ImageQt import ImageQt
+    qimg = ImageQt(pil_img.convert("RGB"))
+    return QPixmap.fromImage(qimg)
+
+
+class _ThumbWorker(SafeWorker):
+    """后台逐页渲染缩略图，通过信号回传 PIL.Image（主线程转 QPixmap）。"""
+
+    sig_thumb = Signal(int, object)  # (行号, PIL.Image)
+    sig_done = Signal()
+
+    def __init__(self, editor, is_stale, parent=None):
+        super().__init__(parent)
+        self._editor = editor
+        self._is_stale = is_stale
+
+    def work(self):
+        try:
+            n = self._editor.page_count
+            for i in range(n):
+                if self._is_stale():
+                    return
+                try:
+                    img = self._editor.get_thumbnail(i)
+                except Exception:  # noqa: BLE001 - 单页失败不中断整体
+                    img = None
+                if img is not None and not self._is_stale():
+                    self.sig_thumb.emit(i, img)
+        finally:
+            self.sig_done.emit()
+
+
+
+class _PageGrid(QListWidget):
+    """页面缩略图网格：图标模式 + 自适应换行 + 内部拖拽排序。"""
+
+    dropped = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setViewMode(QListWidget.IconMode)
+        self.setResizeMode(QListWidget.Adjust)
+        self.setMovement(QListWidget.Static)
+        self.setWrapping(True)
+        self.setSpacing(10)
+        self.setIconSize(QSize(THUMB_W, THUMB_H))
+        self.setGridSize(QSize(THUMB_W + 20, THUMB_H + 44))
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setUniformItemSizes(True)
+
+    def dropEvent(self, e):
+        super().dropEvent(e)
+        self.dropped.emit()
+
+
+# ═══════════════════════════════════════════════
+#  Dialog Windows
+# ═══════════════════════════════════════════════
+
+class _DialogBase(FluentDialogBase):
+    """对话框基类：表单区 + 取消/确定按钮行（深色适配继承自 FluentDialogBase）。"""
+
+    def __init__(self, title, parent=None):
+        super().__init__(title, parent)
+        self._outer = QVBoxLayout(self)
+        self._outer.setContentsMargins(20, 16, 20, 16)
+        self._outer.setSpacing(10)
+
+        self._form = QFormLayout()
+        self._form.setSpacing(10)
+        self._outer.addLayout(self._form)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addStretch(1)
+        btn_cancel = PushButton(tr("取消", "Cancel"))
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        self.btn_ok = PrimaryPushButton(tr("确定", "OK"))
+        self.btn_ok.clicked.connect(self._on_ok)
+        btn_row.addWidget(self.btn_ok)
+        self._outer.addLayout(btn_row)
+
+    def _on_ok(self):
+        raise NotImplementedError
+
+
+class _WatermarkDialog(_DialogBase):
+    POSITIONS = [tr("左上角", "Top left"), tr("右上角", "Top right"), tr("左下角", "Bottom left"), tr("右下角", "Bottom right"), tr("居中", "Center")]
+
+    def __init__(self, parent=None):
+        super().__init__(tr("水印设置", "Watermark settings"), parent)
+        self.ed_text = LineEdit()
+        self.ed_text.setText(tr("格式大师", "FormatMaster"))
+        self.cb_pos = ComboBox()
+        self.cb_pos.addItems(self.POSITIONS)
+        self.cb_pos.setCurrentText(self.POSITIONS[3])
+        self.cb_opacity = ComboBox()
+        self.cb_opacity.addItems(["0.1", "0.2", "0.3", "0.4", "0.5",
+                                  "0.6", "0.7", "0.8", "0.9", "1.0"])
+        self.cb_opacity.setCurrentText("0.3")
+
+        self._form.addRow(tr("水印文字", "Watermark text"), self.ed_text)
+        self._form.addRow(tr("位置", "Position"), self.cb_pos)
+        self._form.addRow(tr("不透明度", "Opacity"), self.cb_opacity)
+
+    def _on_ok(self):
+        text = self.ed_text.text().strip()
+        if not text:
+            toast.show_warning(self, tr("水印文字不能为空", "Watermark text cannot be empty"))
+            return
+        self.result = (text, self.cb_pos.currentIndex(),
+                       round(float(self.cb_opacity.currentText()), 1))
+        self.accept()
+
+
+class _PageNumDialog(_DialogBase):
+    POSITIONS = [tr("底部居中", "Bottom center"), tr("底部左对齐", "Bottom left"), tr("底部右对齐", "Bottom right"), tr("顶部居中", "Top center")]
+
+    def __init__(self, parent=None):
+        super().__init__(tr("页码设置", "Page number settings"), parent)
+        self.sb_start = SpinBox()
+        self.sb_start.setRange(1, 99999)
+        self.sb_start.setValue(1)
+        self.cb_pos = ComboBox()
+        self.cb_pos.addItems(self.POSITIONS)
+        self.cb_pos.setCurrentIndex(0)
+        self.ed_fmt = LineEdit()
+        self.ed_fmt.setText("— {n} —")
+
+        self._form.addRow(tr("起始编号", "Start number"), self.sb_start)
+        self._form.addRow(tr("位置", "Position"), self.cb_pos)
+        self._form.addRow(tr("格式（{n}=页码）", "Format ({n}=page)"), self.ed_fmt)
+
+    def _on_ok(self):
+        self.result = (self.sb_start.value(), self.cb_pos.currentIndex(),
+                       self.ed_fmt.text() or "{n}")
+        self.accept()
+
+
+class _MetadataDialog(_DialogBase):
+    FIELDS = [(tr("标题", "Title"), "title"), (tr("作者", "Author"), "author"),
+              (tr("主题", "Subject"), "subject"),
+              (tr("关键词", "Keywords"), "keywords")]
+
+    def __init__(self, current: dict, parent=None):
+        super().__init__(tr("文档属性", "Document info"), parent)
+        self._entries = {}
+        for label, key in self.FIELDS:
+            ed = LineEdit()
+            ed.setText(current.get(key, "") or "")
+            self._form.addRow(label, ed)
+            self._entries[key] = ed
+
+    def _on_ok(self):
+        self.result = {key: ed.text() for key, ed in self._entries.items()}
+        self.accept()
+
+
+# ═══════════════════════════════════════════════
+#  Main Panel
+# ═══════════════════════════════════════════════
+
+class PdfEditorPanelPage(BaseQtPanel):
+    """PDF 可视化编辑页。"""
+
+    panel_key = "pdf_editor"
+
+    # ── UI 构建 ──────────────────────────────────
+    def build(self):
+        lay = self.content_layout
+        self.editor = PdfEditor()
+        self._render_gen = 0
+        self._worker = None
+        home = os.path.expanduser("~")
+        self._last_dirs = {"open": home, "save": home, "insert": home}
+
+        self.header = PageHeader(
+            tr("PDF 编辑", "PDF editor"),
+            tr("选择页面后可旋转、排序、插入或添加文档信息",
+               "Select pages to rotate, reorder, insert, or annotate"),
+            FluentIcon.EDIT)
+        lay.addWidget(self.header)
+        self.btn_open = PushButton(FluentIcon.FOLDER, tr("打开", "Open"))
+        self.btn_open.clicked.connect(self._open_file)
+        self.header.add_action(self.btn_open)
+        self.btn_save_as = PushButton(tr("另存为", "Save as"))
+        self.btn_save_as.clicked.connect(self._save_as)
+        self.header.add_action(self.btn_save_as)
+        self.btn_save = PrimaryPushButton(FluentIcon.SAVE, tr("保存", "Save"))
+        self.btn_save.clicked.connect(self._save_file)
+        self.header.add_action(self.btn_save)
+
+        lay.addWidget(self._build_toolbar_card())
+
+        # 缩略图网格卡片
+        grid_card = Card()
+        gl = QVBoxLayout(grid_card)
+        gl.setContentsMargins(18, 16, 18, 16)
+        gl.setSpacing(8)
+        preview_head = QHBoxLayout()
+        preview_head.addWidget(
+            self.make_section_header(tr("页面预览", "Page preview"),
+                                     FluentIcon.PHOTO))
+        preview_head.addStretch(1)
+        self.lb_info = CaptionLabel(tr("未打开文件", "No file opened"))
+        # 长文件名允许折行，不让文档名撑宽整个编辑工作区。
+        self.lb_info.setWordWrap(True)
+        self.lb_info.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lb_info.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        preview_head.addWidget(self.lb_info, 1)
+        gl.addLayout(preview_head)
+        self.empty_state = QWidget()
+        self.empty_state.setMinimumHeight(360)
+        self.empty_state.setLayout(EmptyState(
+            FluentIcon.DOCUMENT,
+            tr("打开 PDF，开始整理页面", "Open a PDF to organize its pages"),
+            tr("查看页面缩略图，选择页面后旋转、复制或调整顺序。",
+               "View thumbnails, then select pages to rotate, duplicate, or reorder."),
+            tr("打开 PDF", "Open PDF"), self._open_file))
+        gl.addWidget(self.empty_state)
+        self.grid = _PageGrid()
+        self.grid.setAccessibleName(tr("PDF 页面列表", "PDF page list"))
+        self.grid.setMinimumHeight(360)
+        self.grid.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        gl.addWidget(self.grid)
+        self.lb_status = CaptionLabel(tr("就绪", "Ready"))
+        self.lb_status.setWordWrap(True)
+        gl.addWidget(self.lb_status)
+        lay.addWidget(grid_card, 1)
+
+        self.grid.dropped.connect(self._on_grid_dropped)
+        self.grid.itemSelectionChanged.connect(self._update_status)
+
+        self._blank_pm = self._make_blank_pixmap()
+        self._update_status()
+
+    def _make_blank_pixmap(self):
+        pm = QPixmap(THUMB_W, THUMB_H)
+        pm.fill(Qt.lightGray)
+        return pm
+
+    def _build_toolbar_card(self):
+        card = Card()
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(16, 12, 16, 12)
+        outer.setSpacing(8)
+        self._selection_buttons = []
+        self._document_buttons = []
+        self._insert_buttons = []
+
+        # 复用组件库的流式布局和图标：按操作范围分组，窄窗口自然换行。
+        groups = [
+            (tr("选中页面", "Selected pages"), [
+                (FluentIcon.ROTATE, tr("旋转 90°", "Rotate 90°"), self._rotate_90),
+                (FluentIcon.DELETE, tr("删除", "Delete"), self._delete_selected),
+                (FluentIcon.COPY, tr("复制", "Duplicate"), self._duplicate_selected)]),
+            (tr("插入页面", "Insert pages"), [
+                (FluentIcon.DOCUMENT, tr("插入 PDF", "Insert PDF"), self._insert_pdf),
+                (FluentIcon.PHOTO, tr("插入图片", "Insert image"), self._insert_image),
+                (FluentIcon.ADD, tr("空白页", "Blank page"), self._insert_blank)]),
+            (tr("整份文档", "Whole document"), [
+                (FluentIcon.TAG, tr("水印", "Watermark"), self._add_watermark),
+                (FluentIcon.FONT, tr("页码", "Page numbers"), self._add_page_numbers),
+                (FluentIcon.EDIT, tr("文档属性", "Document info"), self._edit_metadata)]),
+        ]
+        rows = []
+        for group_index, (label, commands) in enumerate(groups):
+            row_widget = QWidget()
+            row = FlowLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setHorizontalSpacing(8)
+            row.setVerticalSpacing(8)
+            caption = CaptionLabel(label)
+            caption.setMinimumHeight(36)
+            caption.setAlignment(Qt.AlignVCenter)
+            row.addWidget(caption)
+            for icon, text, slot in commands:
+                btn = PushButton(icon, text)
+                btn.clicked.connect(slot)
+                row.addWidget(btn)
+                if group_index == 0:
+                    self._selection_buttons.append(btn)
+                else:
+                    self._document_buttons.append(btn)
+                if group_index == 1:
+                    self._insert_buttons.append(btn)
+                elif group_index == 2:
+                    btn.setToolTip(tr("应用于整份文档，不限于选中页",
+                                      "Applies to the whole document, not only selected pages"))
+            outer.addWidget(row_widget)
+            rows.append(row)
+        self.btn_all = PushButton(tr("全选", "Select all"))
+        self.btn_all.clicked.connect(self._toggle_select_all)
+        rows[0].addWidget(self.btn_all)
+        self.btn_inv = PushButton(tr("反选", "Invert selection"))
+        self.btn_inv.clicked.connect(self._invert_selection)
+        rows[0].addWidget(self.btn_inv)
+        self.btn_undo = PushButton(FluentIcon.CANCEL, tr("撤销", "Undo"))
+        self.btn_undo.clicked.connect(self._undo)
+        rows[2].addWidget(self.btn_undo)
+        self._document_buttons.extend((self.btn_all, self.btn_inv))
+        self.lb_selection_hint = CaptionLabel()
+        self.lb_selection_hint.setWordWrap(True)
+        outer.addWidget(self.lb_selection_hint)
+        return card
+
+    # ── 偏好 ────────────────────────────────────
+    def collect_prefs(self) -> dict:
+        return dict(self._last_dirs)
+
+    def apply_prefs(self, prefs: dict):
+        if not prefs:
+            return
+        for key in ("open", "save", "insert"):
+            val = prefs.get(key)
+            if val and os.path.isdir(val):
+                self._last_dirs[key] = val
+
+    def collect_params(self) -> dict:
+        return {}
+
+    # ── 文件操作 ────────────────────────────────
+    def _open_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("打开 PDF 文件", "Open PDF file"), self._last_dirs["open"],
+            tr("PDF 文件 (*.pdf);;所有文件 (*.*)", "PDF files (*.pdf);;All files (*.*)"))
+        if not path:
+            return
+        if not self._confirm_discard_changes():
+            return
+        self._last_dirs["open"] = os.path.dirname(path) or path
+        self._load_pdf(path)
+
+    def _confirm_discard_changes(self):
+        """切换文件前保护尚未保存的编辑结果。"""
+        if not self.editor.modified:
+            return True
+        dlg = MessageBox(
+            tr("放弃未保存更改？", "Discard unsaved changes?"),
+            tr("当前 PDF 的修改尚未保存，继续打开其他文件将丢失这些修改。",
+               "The current PDF has unsaved changes that will be lost."),
+            self)
+        dlg.yesButton.setText(tr("放弃并继续", "Discard and continue"))
+        dlg.cancelButton.setText(tr("返回", "Go back"))
+        return bool(dlg.exec())
+
+    def _load_pdf(self, path):
+        """打开并渲染指定 PDF（_open_file 与外部调用共用）。"""
+        self._stop_render_worker()
+        try:
+            self.editor.open(path)
+        except RuntimeError as e:
+            MessageBox("打开失败", str(e), self).exec()
+            return
+        self.lb_info.setText(os.path.basename(path))
+        self.lb_info.setToolTip(path)
+        self._refresh()
+
+    def _save_file(self):
+        if not self.editor.page_count:
+            return
+        path = self.editor.file_path
+        if path:
+            self._do_save(path)
+        else:
+            self._save_as()
+
+    def _save_as(self):
+        if not self.editor.page_count:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, tr("另存为", "Save as"), self._last_dirs["save"],
+            tr("PDF 文件 (*.pdf);;所有文件 (*.*)", "PDF files (*.pdf);;All files (*.*)"))
+        if not path:
+            return
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        self._last_dirs["save"] = os.path.dirname(path) or path
+        self._do_save(path)
+
+    def _do_save(self, path):
+        self._stop_render_worker()
+        try:
+            self.editor.compact()
+            self.editor.save(path)
+        except RuntimeError as e:
+            MessageBox("保存失败", str(e), self).exec()
+            return
+        self.lb_info.setText(os.path.basename(path))
+        self.lb_info.setToolTip(path)
+        self._refresh()
+        toast.show_success(self, tr("已保存：{}", "Saved: {}").format(path))
+
+    # ── 缩略图渲染 ──────────────────────────────
+    def _refresh(self):
+        """按 editor 当前状态重建网格并启动缩略图渲染。"""
+        self._stop_render_worker()
+        gen = self._render_gen
+        self.grid.blockSignals(True)
+        self.grid.clear()
+        n = self.editor.page_count
+        for i in range(n):
+            it = QListWidgetItem(tr("第 {} 页", "Page {}").format(i + 1))
+            it.setData(Qt.UserRole, i)
+            it.setIcon(QIcon(self._blank_pm))
+            it.setToolTip(tr("第 {} 页", "Page {}").format(i + 1))
+            self.grid.addItem(it)
+        self.grid.blockSignals(False)
+        self._update_status()
+        if n:
+            self._worker = _ThumbWorker(
+                self.editor, lambda: self._render_gen != gen, self)
+            self._worker.sig_thumb.connect(self._place_thumb)
+            self._worker.start()
+
+    def _stop_render_worker(self):
+        """编辑/换文档前收拢旧渲染线程，避免访问已关闭的 PDF 页面。"""
+        self._render_gen += 1
+        worker = self._worker
+        if worker is not None and worker.isRunning():
+            worker.wait(3000)
+        self._worker = None
+
+    def _place_thumb(self, row, pil_img):
+        if row < 0 or row >= self.grid.count():
+            return
+        try:
+            pm = _pil_to_pixmap(pil_img)
+        except Exception:  # noqa: BLE001 - 图像转换失败保留占位图
+            return
+        pm = pm.scaled(THUMB_W - 6, THUMB_H - 6,
+                       Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.grid.item(row).setIcon(QIcon(pm))
+
+    # ── 选择 ────────────────────────────────────
+    def _selected_indices(self):
+        return sorted(self.grid.row(it) for it in self.grid.selectedItems())
+
+    def _require_doc(self) -> bool:
+        if not self.editor.page_count:
+            toast.show_warning(self, tr("请先打开 PDF 文件", "Open a PDF file first"))
+            return False
+        return True
+
+    def _require_selection(self):
+        """要求已打开文档且有选中页；返回排序后的页号列表或 None。"""
+        if not self._require_doc():
+            return None
+        indices = self._selected_indices()
+        if not indices:
+            toast.show_info(self, tr("请先选择要操作的页面", "Select pages to operate on first"))
+            return None
+        return indices
+
+    def _toggle_select_all(self):
+        if not self._require_doc():
+            return
+        if len(self._selected_indices()) == self.editor.page_count:
+            self.grid.clearSelection()
+        else:
+            self.grid.selectAll()
+
+    def _invert_selection(self):
+        if not self._require_doc():
+            return
+        sel = set(self._selected_indices())
+        self.grid.blockSignals(True)
+        self.grid.clearSelection()
+        for i in range(self.grid.count()):
+            if i not in sel:
+                self.grid.item(i).setSelected(True)
+        self.grid.blockSignals(False)
+        self._update_status()
+
+    def _select_indices(self, indices):
+        self.grid.clearSelection()
+        for i in indices:
+            if 0 <= i < self.grid.count():
+                self.grid.item(i).setSelected(True)
+
+    # ── 拖拽排序提交 ─────────────────────────────
+    def _on_grid_dropped(self):
+        order = [self.grid.item(r).data(Qt.UserRole)
+                 for r in range(self.grid.count())]
+        if order == sorted(order):
+            return  # 顺序未变
+        self._stop_render_worker()
+        if self.editor.reorder_pages(order):
+            self._refresh()
+            toast.show_success(self, tr("页面顺序已调整", "Page order updated"))
+
+    # ── 工具栏动作 ──────────────────────────────
+    def _rotate_90(self):
+        indices = self._require_selection()
+        if indices is None:
+            return
+        self._stop_render_worker()
+        if self.editor.rotate_pages(indices, 90):
+            keep = list(indices)
+            self._refresh()
+            self._select_indices(keep)
+            toast.show_success(self, tr("已旋转 {} 页", "Rotated {} pages").format(len(indices)))
+
+    def _delete_selected(self):
+        indices = self._require_selection()
+        if indices is None:
+            return
+        dlg = MessageBox("确认删除", tr("确定要删除选中的 {} 页吗？", "Delete the selected {} pages?").format(len(indices)), self)
+        dlg.yesButton.setText(tr("删除", "Delete"))
+        if not dlg.exec():
+            return
+        self._stop_render_worker()
+        if self.editor.delete_pages(indices):
+            self._refresh()
+            toast.show_success(self, tr("已删除 {} 页", "Deleted {} pages").format(len(indices)))
+
+    def _duplicate_selected(self):
+        indices = self._require_selection()
+        if indices is None:
+            return
+        at = max(indices) + 1
+        self._stop_render_worker()
+        if self.editor.duplicate_pages(indices, at):
+            self._refresh()
+            self._select_indices(list(range(at, at + len(indices))))
+            toast.show_success(self, tr("已复制 {} 页", "Copied {} pages").format(len(indices)))
+
+    def _insert_pdf(self):
+        if not self._require_doc():
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("插入 PDF 文件", "Insert PDF file"), self._last_dirs["insert"],
+            tr("PDF 文件 (*.pdf);;所有文件 (*.*)", "PDF files (*.pdf);;All files (*.*)"))
+        if not path:
+            return
+        self._last_dirs["insert"] = os.path.dirname(path) or path
+        at = self._insert_at()
+        self._stop_render_worker()
+        if self.editor.insert_pdf(at, path):
+            self._refresh()
+            toast.show_success(self, tr("已在位置 {} 插入 PDF", "Inserted PDF at position {}").format(at + 1))
+        else:
+            toast.show_error(self, tr("插入失败：文件无法打开或已加密", "Insert failed: file cannot be opened or is encrypted"))
+
+    def _insert_image(self):
+        if not self._require_doc():
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("插入图片", "Insert image"), self._last_dirs["insert"],
+            tr("图片文件 (*.png *.jpg *.jpeg *.bmp *.tiff *.webp);;所有文件 (*.*)", "Image files (*.png *.jpg *.jpeg *.bmp *.tiff *.webp);;All files (*.*)"))
+        if not path:
+            return
+        self._last_dirs["insert"] = os.path.dirname(path) or path
+        at = self._insert_at()
+        self._stop_render_worker()
+        if self.editor.insert_image(at, path):
+            self._refresh()
+            toast.show_success(self, tr("已在位置 {} 插入图片", "Inserted image at position {}").format(at + 1))
+        else:
+            toast.show_error(self, tr("插入失败：图片无法解析", "Insert failed: image cannot be parsed"))
+
+    def _insert_blank(self):
+        if not self._require_doc():
+            return
+        at = self._insert_at()
+        self._stop_render_worker()
+        if self.editor.insert_blank(at):
+            self._refresh()
+            toast.show_success(self, tr("已在位置 {} 插入空白页", "Inserted blank page at position {}").format(at + 1))
+
+    def _insert_at(self):
+        sel = self._selected_indices()
+        return min(sel) if sel else self.editor.page_count
+
+    def _add_watermark(self):
+        if not self._require_doc():
+            return
+        dlg = _WatermarkDialog(self)
+        if not dlg.exec() or not dlg.result:
+            return
+        text, pos_index, opacity = dlg.result
+        positions = ["左上角", "右上角", "左下角", "右下角", "居中"]
+        pos = positions[max(0, min(pos_index, len(positions) - 1))]
+        self._stop_render_worker()
+        if self.editor.add_watermark(text, pos, opacity):
+            # core 的注释类操作不清缩略图缓存，此处手动清理保证预览同步
+            self.editor._clear_thumb_cache()
+            self._refresh()
+            toast.show_success(self, tr("已添加水印", "Watermark added"))
+
+    def _add_page_numbers(self):
+        if not self._require_doc():
+            return
+        dlg = _PageNumDialog(self)
+        if not dlg.exec() or not dlg.result:
+            return
+        start, pos_index, fmt = dlg.result
+        positions = ["底部居中", "底部左对齐", "底部右对齐", "顶部居中"]
+        pos = positions[max(0, min(pos_index, len(positions) - 1))]
+        self._stop_render_worker()
+        if self.editor.add_page_numbers(start, pos, fmt):
+            self.editor._clear_thumb_cache()
+            self._refresh()
+            toast.show_success(self, tr("已添加页码", "Page numbers added"))
+
+    def _edit_metadata(self):
+        if not self._require_doc():
+            return
+        dlg = _MetadataDialog(self.editor.metadata, self)
+        if not dlg.exec() or dlg.result is None:
+            return
+        self._stop_render_worker()
+        if self.editor.set_metadata(dlg.result):
+            self._update_status()
+            toast.show_success(self, tr("元数据已更新", "Metadata updated"))
+
+    def _undo(self):
+        if not self._require_doc():
+            return
+        self._stop_render_worker()
+        if self.editor.undo():
+            self._refresh()
+            toast.show_success(self, tr("已撤销", "Undone"))
+        else:
+            toast.show_info(self, tr("没有可撤销的操作", "Nothing to undo"))
+
+    # ── 状态栏 ──────────────────────────────────
+    def _update_status(self):
+        n = self.editor.page_count
+        if not n:
+            self.lb_status.setText(tr("请先打开 PDF 文件", "Open a PDF file first"))
+            self._sync_actions()
+            return
+        parts = [tr("共 {} 页", "{} pages").format(n)]
+        sel = len(self._selected_indices())
+        if sel:
+            parts.append(tr("选中 {} 页", "{} pages selected").format(sel))
+        if self.editor.modified:
+            parts.append(tr("● 未保存", "● Unsaved"))
+        self.lb_status.setText("  |  ".join(parts))
+        self._sync_actions()
+
+    def _sync_actions(self):
+        """根据文档、选择和撤销状态同步所有命令，避免无效点击。"""
+        if not hasattr(self, "editor"):
+            return
+        has_doc = self.editor.page_count > 0
+        selected = self._selected_indices()
+        has_selection = has_doc and bool(selected)
+        self.grid.setVisible(has_doc)
+        self.empty_state.setVisible(not has_doc)
+        self.btn_all.setText(tr("取消全选", "Clear selection")
+                             if has_doc and len(selected) == self.editor.page_count
+                             else tr("全选", "Select all"))
+        # 插入沿用引擎的“首个选中页之前 / 无选择时末尾”规则，明确展示而非改变语义。
+        insertion_hint = (tr("插入到第 {} 页之前", "Insert before page {}").format(selected[0] + 1)
+                          if selected else tr("插入到文档末尾", "Insert at the end of the document"))
+        for button in self._insert_buttons:
+            button.setToolTip(insertion_hint)
+        if has_doc:
+            self.lb_selection_hint.setText(
+                tr("Ctrl/⌘ 或 Shift 可多选，拖动缩略图可排序。{}。",
+                   "Ctrl/⌘ or Shift to select multiple pages; drag thumbnails to reorder. {}.").format(insertion_hint))
+        else:
+            self.lb_selection_hint.setText(tr("打开文件后可使用页面和文档工具。",
+                                              "Page and document tools become available after opening a file."))
+        if hasattr(self, "btn_save"):
+            self.btn_save.setEnabled(has_doc and self.editor.modified)
+            self.btn_save_as.setEnabled(has_doc)
+        for button in getattr(self, "_document_buttons", []):
+            button.setEnabled(has_doc)
+        for button in getattr(self, "_selection_buttons", []):
+            button.setEnabled(has_selection)
+        if hasattr(self, "btn_undo"):
+            self.btn_undo.setEnabled(has_doc and self.editor.can_undo)
+
+    # ── 公共 API ────────────────────────────────
+    def is_modified(self) -> bool:
+        return self.editor.modified
+
+    def is_open(self) -> bool:
+        return self.editor.page_count > 0
+
+    def cleanup(self):
+        """关闭文档并等待缩略图线程收尾（主窗口关闭时调用）。"""
+        self._stop_render_worker()
+        self.editor.close()
