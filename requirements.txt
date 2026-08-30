@@ -28,7 +28,7 @@ psutil>=5.9.0
 packaging>=24.0
 # 电子书互转（EPUB/MOBI/PRC/AZW3/TXT/HTML；MOBI/AZW3 目标格式需系统装 Calibre）
 ebooklib>=0.18
-mobi>=0.4
+mobi>=0.4.1
 # 高级控件：pyqtgraph（实时高性能绘图/音频波形）、superqt（双滑块区间等科学控件）
 pyqtgraph>=0.13
 superqt>=0.6
