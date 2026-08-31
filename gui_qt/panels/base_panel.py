@@ -198,6 +198,12 @@ class BaseQtPanel(ScrollArea):
         """创建统一风格的面板标题组件。"""
         return PageHeader(text)
 
+    def resizeEvent(self, event):
+        """内容宽度始终受视口约束，避免 Windows 字体度量撑出横向范围。"""
+        super().resizeEvent(event)
+        if hasattr(self, "content"):
+            self.content.setMaximumWidth(min(1380, self.viewport().width()))
+
     def _promote_primary_action(self):
         """统一将标准任务执行组提升到页面标题行。
 
