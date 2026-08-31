@@ -23,6 +23,20 @@ def _reset_writable_bin_cache():
     config._WRITABLE_BIN_DIR_CACHE = None
 
 
+@pytest.fixture(autouse=True)
+def _reset_user_prefs_between_tests():
+    """每个测试隔离内存偏好，避免 500ms 自动保存定时器产生时序污染。"""
+    from utils.config import USER_PREFS
+
+    USER_PREFS.prefs = {}
+    if getattr(USER_PREFS, "_dirty", None) is not None:
+        USER_PREFS._dirty.clear()
+    yield
+    USER_PREFS.prefs = {}
+    if getattr(USER_PREFS, "_dirty", None) is not None:
+        USER_PREFS._dirty.clear()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _isolate_user_prefs():
     """测试隔离：备份/恢复 user_prefs.json，防止测试污染开发数据。
@@ -48,8 +62,7 @@ def _isolate_user_prefs():
     had = os.path.exists(path)
     if had:
         shutil.copy2(path, bak)
-    else:
-        USER_PREFS.prefs = {}
+    USER_PREFS.prefs = {}
 
     yield
 

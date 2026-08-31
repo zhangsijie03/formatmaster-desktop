@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -90,6 +91,10 @@ def check(tag: str | None, require_clean: bool) -> list[str]:
 
 
 def main() -> int:
+    # GitHub Windows Runner 的默认 stdout 可能是 cp1252。发布信息包含中文，
+    # 显式切到 UTF-8，避免预检实际通过却在打印结果时失败。
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser()
     parser.add_argument("--tag", help="预期发布标签，例如 v1.5.0-beta.1")
     parser.add_argument("--require-clean", action="store_true")
