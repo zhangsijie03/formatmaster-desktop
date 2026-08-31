@@ -62,9 +62,11 @@ def test_release_workflow_builds_and_validates_dmg():
 def test_unsigned_macos_fallback_is_explicit_and_clearly_labeled():
     text = _workflow_text()
     assert "unsigned_macos:" in text
+    assert '"build-macos-v1.0.0"' in text
+    assert "github.ref_name == 'build-macos-v1.0.0'" in text
     assert "type: boolean" in text
-    assert 'if: ${{ inputs.unsigned_macos }}' in text
-    assert 'if: ${{ !inputs.unsigned_macos }}' in text
+    assert "github.ref_name == 'build-macos-v1.0.0' || inputs.unsigned_macos" in text
+    assert "github.ref_name != 'build-macos-v1.0.0' && !inputs.unsigned_macos" in text
     assert "Signature=adhoc" in text
     assert "*-unsigned.dmg" in text
     assert 'gh release upload "$RELEASE_TAG"' in text

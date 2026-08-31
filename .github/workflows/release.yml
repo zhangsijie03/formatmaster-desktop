@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+      - "build-macos-v1.0.0"
   workflow_dispatch:
     inputs:
       tag:
@@ -25,7 +26,7 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.11"
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  RELEASE_TAG: ${{ github.ref_name == 'build-macos-v1.0.0' && 'v1.0.0' || (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name) }}
   YTDLP_VERSION: "2026.08.19"
   YTDLP_MACOS_SHA256: "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202"
   YTDLP_WINDOWS_SHA256: "66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a"
@@ -146,7 +147,7 @@ jobs:
             --sbom "$RUNNER_TEMP/FormatMaster-${RELEASE_TAG#v}-macOS-${{ matrix.arch }}.spdx.json"
 
       - name: 校验 macOS 正式签名配置
-        if: ${{ !inputs.unsigned_macos }}
+        if: ${{ github.ref_name != 'build-macos-v1.0.0' && !inputs.unsigned_macos }}
         env:
           MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -163,7 +164,7 @@ jobs:
           test -n "$APPLE_APP_PASSWORD"
 
       - name: 安装 Developer ID 证书
-        if: ${{ !inputs.unsigned_macos }}
+        if: ${{ github.ref_name != 'build-macos-v1.0.0' && !inputs.unsigned_macos }}
         env:
           CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -187,7 +188,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: 配置 Apple notarization
-        if: ${{ !inputs.unsigned_macos }}
+        if: ${{ github.ref_name != 'build-macos-v1.0.0' && !inputs.unsigned_macos }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -204,7 +205,7 @@ jobs:
         env:
           FORMATMASTER_DIST: ${{ runner.temp }}/formatmaster-dist
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-          ALLOW_UNSIGNED_MACOS: ${{ inputs.unsigned_macos }}
+          ALLOW_UNSIGNED_MACOS: ${{ github.ref_name == 'build-macos-v1.0.0' || inputs.unsigned_macos }}
         run: |
           if [ "$ALLOW_UNSIGNED_MACOS" = "true" ]; then
             # 兜底包使用 build.py 内置的 ad-hoc 签名，并在文件名中明确标识。
@@ -224,7 +225,7 @@ jobs:
       - name: 验证 DMG 并重命名
         env:
           FORMATMASTER_DIST: ${{ runner.temp }}/formatmaster-dist
-          ALLOW_UNSIGNED_MACOS: ${{ inputs.unsigned_macos }}
+          ALLOW_UNSIGNED_MACOS: ${{ github.ref_name == 'build-macos-v1.0.0' || inputs.unsigned_macos }}
         run: |
           DMG="$FORMATMASTER_DIST/格式大师-macOS.dmg"
           VERSION="${RELEASE_TAG#v}"
@@ -285,7 +286,7 @@ jobs:
   build-windows:
     name: Windows x64
     needs: verify-source
-    if: ${{ !inputs.unsigned_macos }}
+    if: ${{ github.ref_name != 'build-macos-v1.0.0' && !inputs.unsigned_macos }}
     runs-on: windows-2025
     permissions:
       contents: read
@@ -450,7 +451,7 @@ jobs:
   publish:
     name: 发布 GitHub Release
     needs: [build-macos, build-windows]
-    if: ${{ !inputs.unsigned_macos }}
+    if: ${{ github.ref_name != 'build-macos-v1.0.0' && !inputs.unsigned_macos }}
     runs-on: ubuntu-latest
     permissions:
       attestations: write
@@ -510,7 +511,7 @@ jobs:
   publish-unsigned-macos:
     name: 上传未公证 macOS 安装包
     needs: build-macos
-    if: ${{ inputs.unsigned_macos }}
+    if: ${{ github.ref_name == 'build-macos-v1.0.0' || inputs.unsigned_macos }}
     runs-on: ubuntu-latest
     permissions:
       attestations: write
