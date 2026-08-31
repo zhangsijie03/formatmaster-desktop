@@ -222,6 +222,28 @@ def test_macos_release_pipeline_builds_signed_notarized_dmg(
                and "validate" in call for call in calls)
 
 
+def test_macos_dmg_retries_only_transient_resource_busy(monkeypatch, tmp_path):
+    app = tmp_path / "FormatMaster.app"
+    app.mkdir()
+    output = tmp_path / "FormatMaster.dmg"
+    attempts = []
+
+    monkeypatch.setattr(build.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(build.os, "symlink", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(build.time, "sleep", lambda seconds: attempts.append(seconds))
+
+    def fake_run(_cmd, **_kwargs):
+        if len(attempts) < 2:
+            return SimpleNamespace(returncode=1, stdout="",
+                                   stderr="Resource busy")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(build.subprocess, "run", fake_run)
+
+    assert build._create_macos_dmg(str(app), str(output)) == str(output)
+    assert attempts == [2, 4]
+
+
 def test_macos_notarization_requires_signing_identity(monkeypatch, tmp_path):
     monkeypatch.setattr(build.sys, "platform", "darwin")
     try:

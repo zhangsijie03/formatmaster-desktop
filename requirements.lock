@@ -1058,7 +1058,13 @@ omegaconf==2.3.1 \
     --hash=sha256:3d701d14e9a8828f1edd28bb70b725908b34277cdd72cf7d6a83f94dadc6b6a0 \
     --hash=sha256:e5e7de64aeebeddaf8e6d3f7a783b32ac2a01c0fbd9c878012caecb891a1f42a
     # via rapid-table
-onnxruntime==1.29.0 \
+onnxruntime==1.23.2 ; sys_platform == "darwin" and platform_machine == "x86_64" \
+    --hash=sha256:87d8b6eaf0fbeb6835a60a4265fde7a3b60157cf1b2764773ac47237b4d48612
+    # via
+    #   -r requirements.txt
+    #   rapid-table
+    #   rapidocr-onnxruntime
+onnxruntime==1.29.0 ; sys_platform != "darwin" or platform_machine != "x86_64" \
     --hash=sha256:07c5907474dec4a2792fd7626b753dc66707808385a6d9eecf993db0066a9d0f \
     --hash=sha256:0d4f427afac434b0070fe992b540ddf20a7aff2265f760f314d91331935b6b98 \
     --hash=sha256:11264bb58f7b7cf6af835ab10d36838d73680580820fd6f51d90124a1ca8f449 \

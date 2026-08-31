@@ -64,6 +64,7 @@ def test_unsigned_macos_fallback_is_explicit_and_clearly_labeled():
     assert "unsigned_macos:" in text
     assert '"build-macos-v1.0.0-*"' in text
     assert "startsWith(github.ref_name, 'build-macos-v1.0.0-')" in text
+    assert "github.ref_name || env.RELEASE_TAG" in text
     assert "type: boolean" in text
     assert "startsWith(github.ref_name, 'build-macos-v1.0.0-') || inputs.unsigned_macos" in text
     assert "!startsWith(github.ref_name, 'build-macos-v1.0.0-') && !inputs.unsigned_macos" in text

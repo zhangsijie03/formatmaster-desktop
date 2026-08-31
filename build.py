@@ -13,6 +13,7 @@ import plistlib
 import re
 import shutil
 import tempfile
+import time
 
 from utils.config import APP_VERSION
 
@@ -211,11 +212,21 @@ def _create_macos_dmg(app_path, output_path):
         # Applications 别名是 macOS 用户最熟悉的拖拽安装路径；失败时让
         # hdiutil 命令直接报错，避免生成一个看似成功但布局不完整的 DMG。
         os.symlink("/Applications", os.path.join(staging, "Applications"))
-        _run_macos_release_command(
-            [hdiutil, "create", "-volname", "FormatMaster", "-srcfolder",
-             staging, "-ov", "-format", "UDZO", "-imagekey", "zlib-level=9",
-             output_path],
-            "macOS DMG 制作")
+        command = [hdiutil, "create", "-volname", "FormatMaster",
+                   "-srcfolder", staging, "-ov", "-format", "UDZO",
+                   "-imagekey", "zlib-level=9", output_path]
+        for attempt in range(1, 4):
+            try:
+                _run_macos_release_command(command, "macOS DMG 制作")
+                break
+            except RuntimeError as exc:
+                # GitHub macOS runner 的 diskimages-helper 偶尔短暂占用资源；
+                # 仅重试这一瞬时错误，避免掩盖空间不足或参数错误。
+                if "Resource busy" not in str(exc) or attempt == 3:
+                    raise
+                if os.path.exists(output_path):
+                    os.unlink(output_path)
+                time.sleep(attempt * 2)
     return output_path
 
 
