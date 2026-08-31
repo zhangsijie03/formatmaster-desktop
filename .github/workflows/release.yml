@@ -91,7 +91,7 @@ jobs:
           - arch: x86_64
             runner: macos-15-intel
             binary_arch: x64
-            ffmpeg_sha256: e17cd7bcdecfb4b49d7614fd2c0ff1cd5f59616a556683942af4b075fcd659f0
+            ffmpeg_sha256: 4a4a968b98859588e98500ae25973d80a5ca5eed0724222b9f76360dcb72a001
             ffprobe_sha256: ce5414269f0efa1e88b5e23b57f801d5b9a40be554716544936e0332b4601a62
     permissions:
       contents: read
