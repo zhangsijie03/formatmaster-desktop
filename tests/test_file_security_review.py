@@ -130,7 +130,8 @@ def test_certificate_private_key_is_encrypted_and_restricted(tmp_path):
     loaded = serialization.load_pem_private_key(
         key_path.read_bytes(), password=b"certificate-secret")
     assert loaded is not None
-    assert key_path.stat().st_mode & 0o077 == 0
+    if os.name != "nt":
+        assert key_path.stat().st_mode & 0o077 == 0
     # 页面生成的加密私钥可直接用于本工具的签名流程。
     from core.crypto_advanced import sign_file, verify_signature
     source = tmp_path / "signed.txt"

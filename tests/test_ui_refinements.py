@@ -7,6 +7,7 @@
 """
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -197,8 +198,10 @@ def test_video_frame_panel_isolates_outputs_and_reflows(app_ctx, tmp_path):
         panel._reserved_frame_dirs = set()
         task_a = panel._make_task(str(first))
         task_b = panel._make_task(str(second))
-        assert task_a["output_path"].endswith("same_frames/frame_00000.jpg")
-        assert task_b["output_path"].endswith("same_frames_1/frame_00000.jpg")
+        assert Path(task_a["output_path"]).parts[-2:] == (
+            "same_frames", "frame_00000.jpg")
+        assert Path(task_b["output_path"]).parts[-2:] == (
+            "same_frames_1", "frame_00000.jpg")
 
         panel.resize(700, 720)
         panel.show()

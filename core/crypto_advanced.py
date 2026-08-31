@@ -9,8 +9,10 @@
 依赖 cryptography；缺失时 _CRYPTO_OK=False，各函数给出明确提示。
 """
 import base64
+import getpass
 import os
 import secrets
+import subprocess
 import tempfile
 
 try:
@@ -54,6 +56,21 @@ def _cleanup_stage(path):
             os.remove(path)
         except OSError:
             pass
+
+
+def _restrict_private_file(path):
+    """将私钥限制为当前用户可访问，分别使用 Windows ACL / POSIX mode。"""
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+        return
+    username = getpass.getuser()
+    domain = os.environ.get("USERDOMAIN", "").strip()
+    account = f"{domain}\\{username}" if domain else username
+    result = subprocess.run(
+        ["icacls", path, "/inheritance:r", "/grant:r", f"{account}:F"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0:
+        raise OSError(f"无法限制私钥文件权限：{result.stderr.strip()}")
 
 
 def _read_exact(stream, size, label):
@@ -545,7 +562,7 @@ def generate_self_signed_cert(common_name, output_path, private_key_path=None,
                     encryption_algorithm=encryption))
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.chmod(key_stage, 0o600)
+            _restrict_private_file(key_stage)
             os.replace(key_stage, private_key_path)
             key_stage = ""
         os.replace(cert_stage, output_path)

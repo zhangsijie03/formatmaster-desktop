@@ -29,6 +29,9 @@ class BaseQtPanel(ScrollArea):
         self.services = services
         self.setObjectName(f"panel_{self.panel_key}")
         self.setWidgetResizable(True)
+        # 所有表单都有窄屏重排逻辑；Windows 字体度量可能比 macOS/Linux
+        # 多出数十像素，禁止因此出现无意义的横向滚动条并让内容按视口收缩。
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setViewportMargins(0, 0, 0, 0)
 
         self.content = QWidget()
