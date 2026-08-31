@@ -10,6 +10,11 @@ on:
         description: "要构建的版本标签，例如 v1.4.8"
         required: true
         type: string
+      unsigned_macos:
+        description: "仅构建并上传未公证的 macOS DMG（无 Apple Developer 证书时使用）"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -141,6 +146,7 @@ jobs:
             --sbom "$RUNNER_TEMP/FormatMaster-${RELEASE_TAG#v}-macOS-${{ matrix.arch }}.spdx.json"
 
       - name: 校验 macOS 正式签名配置
+        if: ${{ !inputs.unsigned_macos }}
         env:
           MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -157,6 +163,7 @@ jobs:
           test -n "$APPLE_APP_PASSWORD"
 
       - name: 安装 Developer ID 证书
+        if: ${{ !inputs.unsigned_macos }}
         env:
           CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -180,6 +187,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: 配置 Apple notarization
+        if: ${{ !inputs.unsigned_macos }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -196,7 +204,13 @@ jobs:
         env:
           FORMATMASTER_DIST: ${{ runner.temp }}/formatmaster-dist
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          ALLOW_UNSIGNED_MACOS: ${{ inputs.unsigned_macos }}
         run: |
+          if [ "$ALLOW_UNSIGNED_MACOS" = "true" ]; then
+            # 兜底包使用 build.py 内置的 ad-hoc 签名，并在文件名中明确标识。
+            python build.py --dmg
+            exit 0
+          fi
           if [ -n "${MACOS_SIGN_IDENTITY:-}" ] && [ -z "${MACOS_KEYCHAIN_PATH:-}" ]; then
             echo "配置了 MACOS_SIGNING_IDENTITY，但没有 MACOS_CERTIFICATE_P12_BASE64"
             exit 1
@@ -210,6 +224,7 @@ jobs:
       - name: 验证 DMG 并重命名
         env:
           FORMATMASTER_DIST: ${{ runner.temp }}/formatmaster-dist
+          ALLOW_UNSIGNED_MACOS: ${{ inputs.unsigned_macos }}
         run: |
           DMG="$FORMATMASTER_DIST/格式大师-macOS.dmg"
           VERSION="${RELEASE_TAG#v}"
@@ -230,9 +245,13 @@ jobs:
           test -f "$MOUNT_POINT/THIRD_PARTY_NOTICES.md"
           test -f "$MOUNT_POINT/THIRD_PARTY_LICENSES.md"
           codesign --verify --deep --strict "$APP"
-          codesign --display --verbose=4 "$APP" 2>&1 | grep -F "Authority=Developer ID Application"
-          spctl --assess --type execute --verbose=2 "$APP"
-          xcrun stapler validate "$DMG"
+          if [ "$ALLOW_UNSIGNED_MACOS" = "true" ]; then
+            codesign --display --verbose=4 "$APP" 2>&1 | grep -F "Signature=adhoc"
+          else
+            codesign --display --verbose=4 "$APP" 2>&1 | grep -F "Authority=Developer ID Application"
+            spctl --assess --type execute --verbose=2 "$APP"
+            xcrun stapler validate "$DMG"
+          fi
           BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c \
             'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
           RELEASE_VERSION="$(/usr/libexec/PlistBuddy -c \
@@ -246,7 +265,11 @@ jobs:
           "$APP/Contents/MacOS/FormatMaster" --self-test-package
           hdiutil detach "$MOUNT_POINT"
           trap - EXIT
-          OUTPUT="FormatMaster-${VERSION}-macOS-${{ matrix.arch }}.dmg"
+          SUFFIX=""
+          if [ "$ALLOW_UNSIGNED_MACOS" = "true" ]; then
+            SUFFIX="-unsigned"
+          fi
+          OUTPUT="FormatMaster-${VERSION}-macOS-${{ matrix.arch }}${SUFFIX}.dmg"
           mv "$DMG" "$RUNNER_TEMP/$OUTPUT"
           echo "$RUNNER_TEMP/$OUTPUT" > "$RUNNER_TEMP/release-asset-path"
 
@@ -262,6 +285,7 @@ jobs:
   build-windows:
     name: Windows x64
     needs: verify-source
+    if: ${{ !inputs.unsigned_macos }}
     runs-on: windows-2025
     permissions:
       contents: read
@@ -426,6 +450,7 @@ jobs:
   publish:
     name: 发布 GitHub Release
     needs: [build-macos, build-windows]
+    if: ${{ !inputs.unsigned_macos }}
     runs-on: ubuntu-latest
     permissions:
       attestations: write
@@ -481,3 +506,43 @@ jobs:
             --title "FormatMaster ${RELEASE_TAG}" \
             --notes-file "$NOTES" \
             --verify-tag "${prerelease_args[@]}"
+
+  publish-unsigned-macos:
+    name: 上传未公证 macOS 安装包
+    needs: build-macos
+    if: ${{ inputs.unsigned_macos }}
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: 下载 macOS 构建产物
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: release-assets
+
+      - name: 整理并校验 macOS 安装包
+        run: |
+          mkdir -p release-assets-flat
+          find release-assets -type f \( -name '*-unsigned.dmg' -o -name '*.spdx.json' \) -exec cp {} release-assets-flat/ \;
+          cd release-assets-flat
+          VERSION="${RELEASE_TAG#v}"
+          test -f "FormatMaster-${VERSION}-macOS-arm64-unsigned.dmg"
+          test -f "FormatMaster-${VERSION}-macOS-x86_64-unsigned.dmg"
+          test -f "FormatMaster-${VERSION}-macOS-arm64.spdx.json"
+          test -f "FormatMaster-${VERSION}-macOS-x86_64.spdx.json"
+          sha256sum * > SHA256SUMS-macOS-unsigned.txt
+          cat SHA256SUMS-macOS-unsigned.txt
+
+      - name: 生成 GitHub 构建溯源证明
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: release-assets-flat/*
+
+      - name: 上传到已有 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null
+          gh release upload "$RELEASE_TAG" release-assets-flat/*
