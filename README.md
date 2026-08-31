@@ -11,13 +11,13 @@
 
 ![License](https://img.shields.io/badge/License-AGPL--3.0--or--later-green.svg)
 
-![Release](https://img.shields.io/badge/Release-v1.5.0--beta.1-orange.svg)
+![Release](https://img.shields.io/badge/Release-v1.0.0-blue.svg)
 
 ---
 
 ### License
 
-FormatMaster v1.5.0-beta.1 and later are licensed under
+FormatMaster public releases are licensed under
 [AGPL-3.0-or-later](LICENSE). Historical MIT attribution is preserved in
 [NOTICE](NOTICE). Third-party components remain subject to their own terms in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
