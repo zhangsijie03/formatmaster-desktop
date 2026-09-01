@@ -73,6 +73,7 @@ def test_unsigned_macos_fallback_is_explicit_and_clearly_labeled():
     assert "Signature=adhoc" in text
     assert "*-unsigned.dmg" in text
     assert 'gh release upload "$RELEASE_TAG"' in text
+    assert "GH_REPO: ${{ github.repository }}" in text
 
 
 def test_release_workflow_publishes_checksums_and_assets():

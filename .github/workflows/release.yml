@@ -496,6 +496,7 @@ jobs:
       - name: 发布 Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           NOTES="docs/releases/${RELEASE_TAG}.md"
           test -f "$NOTES"
@@ -548,6 +549,7 @@ jobs:
       - name: 上传到已有 Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release view "$RELEASE_TAG" >/dev/null
           gh release upload "$RELEASE_TAG" release-assets-flat/*
