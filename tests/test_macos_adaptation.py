@@ -222,6 +222,24 @@ def test_macos_release_pipeline_builds_signed_notarized_dmg(
                and "validate" in call for call in calls)
 
 
+def test_macos_adhoc_signing_preserves_nested_executables(monkeypatch):
+    calls = []
+    monkeypatch.setattr(build, "_require_macos_tool",
+                        lambda _name: "/usr/bin/codesign")
+    monkeypatch.setattr(
+        build, "_run_macos_release_command",
+        lambda cmd, label: calls.append((cmd, label)))
+
+    build._sign_macos_app_adhoc("/tmp/FormatMaster.app")
+
+    sign_command = calls[0][0]
+    verify_command = calls[1][0]
+    assert "--deep" not in sign_command
+    assert "--force" in sign_command
+    assert "--deep" in verify_command
+    assert "--strict" in verify_command
+
+
 def test_macos_dmg_retries_only_transient_resource_busy(monkeypatch, tmp_path):
     app = tmp_path / "FormatMaster.app"
     app.mkdir()

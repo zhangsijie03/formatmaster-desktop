@@ -178,8 +178,11 @@ def _sign_macos_app(app_path, identity):
 def _sign_macos_app_adhoc(app_path):
     """为未配置 Developer ID 的公开构建恢复有效的临时签名。"""
     codesign = _require_macos_tool("codesign")
+    # PyInstaller 生成的 yt-dlp 单文件程序已有有效的 ad-hoc 签名；使用
+    # --deep --force 会改写其 Mach-O，导致内置归档无法启动。这里只重签因
+    # Info.plist 变更而失效的应用外层，再递归验证全部内嵌代码。
     _run_macos_release_command(
-        [codesign, "--deep", "--force", "--sign", "-", app_path],
+        [codesign, "--force", "--sign", "-", app_path],
         "macOS 临时签名")
     _run_macos_release_command(
         [codesign, "--verify", "--deep", "--strict", "--verbose=2", app_path],
