@@ -189,6 +189,20 @@ def _sign_macos_app_adhoc(app_path):
         "macOS 临时签名验证")
 
 
+def _restore_macos_adhoc_ytdlp(app_path, project_dir):
+    """恢复被 PyInstaller BUNDLE 重签后无法启动的 yt-dlp 单文件程序。"""
+    source = os.path.join(project_dir, "bin", "yt-dlp")
+    target = os.path.join(
+        app_path, "Contents", "Frameworks", "bin", "yt-dlp")
+    if not os.path.isfile(source) or not os.path.isfile(target):
+        raise RuntimeError("macOS 发布包缺少可恢复的 yt-dlp")
+    # 上游 yt-dlp_macos 是自带有效 ad-hoc 签名的 PyInstaller 单文件程序；
+    # 再次 codesign 会破坏其内置归档。外层应用签名前恢复原文件，让 bundle
+    # 的资源封装覆盖最终字节，同时保留工具自身签名。
+    shutil.copy2(source, target)
+    os.chmod(target, os.stat(target).st_mode | 0o111)
+
+
 def _create_macos_dmg(app_path, output_path):
     """将 .app 制作为带 Applications 快捷方式的压缩 DMG。
 
@@ -506,6 +520,11 @@ def main(onefile=False, sign_identity=None, notarize_profile=None,
             else:
                 print("警告：未能写入 Finder 文件关联，请检查 .app 是否生成。")
             try:
+                if not sign_identity:
+                    app_path = _find_macos_bundle(dist_path)
+                    if not app_path:
+                        raise RuntimeError("未找到 PyInstaller 生成的 .app")
+                    _restore_macos_adhoc_ytdlp(app_path, project_dir)
                 dmg = _finalize_macos_release(
                     dist_path, out_root, sign_identity=sign_identity,
                     notarize_profile=notarize_profile, make_dmg=make_dmg)

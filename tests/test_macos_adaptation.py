@@ -240,6 +240,22 @@ def test_macos_adhoc_signing_preserves_nested_executables(monkeypatch):
     assert "--strict" in verify_command
 
 
+def test_macos_adhoc_build_restores_upstream_ytdlp(tmp_path):
+    project_dir = tmp_path / "source"
+    app = tmp_path / "FormatMaster.app"
+    source = project_dir / "bin" / "yt-dlp"
+    target = app / "Contents" / "Frameworks" / "bin" / "yt-dlp"
+    source.parent.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    source.write_bytes(b"upstream-signed-ytdlp")
+    target.write_bytes(b"pyinstaller-resigned-ytdlp")
+
+    build._restore_macos_adhoc_ytdlp(str(app), str(project_dir))
+
+    assert target.read_bytes() == b"upstream-signed-ytdlp"
+    assert os.access(target, os.X_OK)
+
+
 def test_macos_dmg_retries_only_transient_resource_busy(monkeypatch, tmp_path):
     app = tmp_path / "FormatMaster.app"
     app.mkdir()
