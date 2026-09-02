@@ -557,6 +557,11 @@ class MainWindow(FluentWindow):
         try:
             for key, page in self.pages.items():
                 if page is interface:
+                    # 转换预设归属于最近使用的具体工具；管理页和首页不覆盖它。
+                    if key not in {
+                            "home", "history", "settings", "plugins",
+                            "lan_transfer", "mediainfo"}:
+                        self._last_tool_page_key = key
                     if self.services.get_pref("nav_page", "") != key:
                         self.services.set_pref("nav_page", key)
                         self.services.prefs.flush()

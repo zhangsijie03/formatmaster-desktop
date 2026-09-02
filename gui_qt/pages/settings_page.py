@@ -1697,7 +1697,7 @@ class SettingsPage(ScrollArea):
         self.preset_store = _make_preset_store()
 
         self.card_apply_preset = card = SettingCard(FluentIcon.LIBRARY, tr("应用预设", "Apply preset"),
-                           tr("把保存的参数组合一键应用到所有面板", "Apply a saved param combo to all panels"), g)
+                           tr("恢复参数并进入对应工具", "Restore settings and open its tool"), g)
         self.cb_preset = ComboBox()
         self.cb_preset.setFixedWidth(160)
         self.cb_preset.setAccessibleName(tr("已保存的预设", "Saved presets"))
@@ -1714,8 +1714,8 @@ class SettingsPage(ScrollArea):
 
         self.card_save_preset = PushSettingCard(
             tr("保存预设", "Save preset"), FluentIcon.ADD,
-            tr("保存当前所有面板参数", "Save current panel params"),
-            tr("把当前各面板的参数组合保存为命名预设，可一键复用", "Save current panel settings as a named preset for reuse"), g)
+            tr("保存最近使用工具的参数", "Save recent tool settings"),
+            tr("先调整工具参数，再到这里保存为命名预设", "Configure a tool, then save its settings here"), g)
         self.card_save_preset.clicked.connect(self._save_preset)
         g.addSettingCard(self.card_save_preset)
         self._reload_preset_list()
@@ -1732,7 +1732,8 @@ class SettingsPage(ScrollArea):
             self.cb_preset.setCurrentIndex(0)
         self.cb_preset.blockSignals(False)
         self.card_apply_preset.setContent(
-            tr("应用参数，不会开始转换", "Apply settings without converting")
+            tr("应用后进入对应工具，不会自动开始转换",
+               "Opens its tool after applying; conversion does not start")
             if names else tr("暂无预设，请先保存", "No presets. Save one below."))
         self._sync_preset_actions()
 
@@ -1762,6 +1763,12 @@ class SettingsPage(ScrollArea):
 
     def _save_named_preset(self):
         from gui_qt.components import toast
+        target_key, target_page = self._preset_target_page()
+        if target_page is None:
+            toast.show_warning(
+                self, tr("请先打开一个工具并调整参数，再保存预设。",
+                         "Open a tool and configure it before saving a preset."))
+            return
         name, ok = QInputDialog.getText(
             self, tr("保存预设", "Save preset"),
             tr("预设名称：", "Preset name:"))
@@ -1773,21 +1780,23 @@ class SettingsPage(ScrollArea):
                 tr("预设“{}”已存在，是否用当前参数覆盖？", 'Preset "{}" exists. Replace it with current settings?').format(name),
                 tr("覆盖", "Overwrite")):
             return
-        panels = {}
-        for page in getattr(self.main_window, "pages", {}).values():
-            collect = getattr(page, "collect_prefs", None)
-            key = getattr(page, "panel_key", None)
-            if callable(collect) and key:
-                try:
-                    panels[key] = collect()
-                except Exception:  # noqa: BLE001 - 不用不完整快照覆盖已有预设
-                    LOGGER.exception("收集面板预设失败: %s", key)
-                    toast.show_error(self, tr("无法读取面板参数，预设未保存。", "Could not read panel settings. Preset was not saved."))
-                    return
-        if not panels:
-            toast.show_warning(self, tr("暂无可保存的面板参数，请先打开一个转换功能。",
-                                        "No panel settings to save. Open a conversion tool first."))
+        collect = getattr(target_page, "collect_prefs", None)
+        panel_key = getattr(target_page, "panel_key", None) or target_key
+        try:
+            prefs = collect() if callable(collect) else None
+        except Exception:  # noqa: BLE001 - 不用不完整快照覆盖已有预设
+            LOGGER.exception("收集面板预设失败: %s", panel_key)
+            toast.show_error(
+                self, tr("无法读取工具参数，预设未保存。",
+                         "Could not read tool settings. Preset was not saved."))
             return
+        if not panel_key or not isinstance(prefs, dict) or not prefs:
+            toast.show_warning(
+                self, tr("当前工具没有可保存的参数。",
+                         "This tool has no settings to save."))
+            return
+        # 一个新预设只描述一个明确工具，首页才能给出可理解的一键入口。
+        panels = {panel_key: prefs}
         self.preset_store.save(name, panels)
         self._reload_preset_list(preferred=name)
         toast.show_success(self, tr("预设已保存：{}", "Preset saved: {}").format(name))
@@ -1820,16 +1829,26 @@ class SettingsPage(ScrollArea):
             return
         applied = 0
         failed = 0
-        for page in getattr(self.main_window, "pages", {}).values():
-            apply = getattr(page, "apply_prefs", None)
-            key = getattr(page, "panel_key", None)
-            if callable(apply) and key and key in panels:
-                try:
-                    apply(panels[key])
-                    applied += 1
-                except Exception:  # noqa: BLE001 - 保留其余可应用面板
-                    failed += 1
-                    LOGGER.exception("应用面板预设失败: %s", key)
+        target_page = None
+        for key, prefs in panels.items():
+            page = getattr(self.main_window, "pages", {}).get(key)
+            if page is None:
+                continue
+            real_page = page._ensure() if hasattr(page, "_ensure") else page
+            apply = getattr(real_page, "apply_prefs", None)
+            if not callable(apply):
+                continue
+            try:
+                apply(prefs)
+                applied += 1
+                if target_page is None:
+                    target_page = page
+            except Exception:  # noqa: BLE001 - 保留其余可应用面板
+                failed += 1
+                LOGGER.exception("应用面板预设失败: %s", key)
+        switch_to = getattr(self.main_window, "switchTo", None)
+        if target_page is not None and callable(switch_to):
+            switch_to(target_page)
         if failed:
             toast.show_warning(
                 self,
@@ -1837,9 +1856,28 @@ class SettingsPage(ScrollArea):
                    "Applied {} panels; {} failed. Check the log").format(
                        applied, failed))
         else:
-            toast.show_success(
-                self, tr("已应用 {} 个面板的参数",
-                         "Applied params to {} panels").format(applied))
+            toast.show_success(self, tr(
+                "已应用参数并打开对应工具，请选择文件。",
+                "Settings applied and tool opened. Choose a file to continue."))
+
+    def _preset_target_page(self):
+        """返回最近使用的可保存工具；测试替身兼容单一已加载页面。"""
+        pages = getattr(self.main_window, "pages", {})
+        target_key = getattr(self.main_window, "_last_tool_page_key", "")
+        if target_key in pages:
+            page = pages[target_key]
+            real_page = page._ensure() if hasattr(page, "_ensure") else page
+            if callable(getattr(real_page, "collect_prefs", None)):
+                return target_key, real_page
+
+        # 升级后的首次使用可能还没有最近工具记录，只回退已构建页面，
+        # 避免为了保存预设而实例化全部懒加载工具。
+        for key, page in pages.items():
+            real_page = getattr(page, "_real", page)
+            if real_page is not None and callable(
+                    getattr(real_page, "collect_prefs", None)):
+                return key, real_page
+        return "", None
 
     def _delete_preset(self):
         from gui_qt.components import toast

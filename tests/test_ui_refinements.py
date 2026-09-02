@@ -1128,22 +1128,24 @@ def test_macos_cpu_uses_chip_type_not_machine_name(monkeypatch):
 
 
 def test_home_desktop_system_info_spans_full_width(app_ctx):
-    """运行环境默认折叠，展开后按窗口宽度重排且不丢失诊断能力。"""
-    from gui_qt.pages.home_page import HomePage
+    """运行状态固定展开，并按窗口宽度选择完整且紧凑的排列。"""
+    from gui_qt.pages.home_page import (
+        RUNTIME_STATUS_COMPACT_HEIGHT, RUNTIME_STATUS_HEIGHT, HomePage)
 
     app, win, services = app_ctx
     page = HomePage(win, services)
     try:
-        assert page.environment_content.isHidden()
-        page._toggle_environment(True)
         assert not page.environment_content.isHidden()
+        assert not hasattr(page, "btn_environment")
         page._relayout_main(False)
+        assert page.environment_card.height() == RUNTIME_STATUS_HEIGHT
         index = page.main_grid.indexOf(page.sysinfo)
         row, column, row_span, column_span = page.main_grid.getItemPosition(index)
         assert (row, column, row_span, column_span) == (0, 1, 1, 1)
-        assert page.sysinfo._horizontal is False
+        assert page.sysinfo._horizontal is True
 
         page._relayout_main(True)
+        assert page.environment_card.height() == RUNTIME_STATUS_COMPACT_HEIGHT
         index = page.main_grid.indexOf(page.sysinfo)
         row, column, row_span, column_span = page.main_grid.getItemPosition(index)
         assert (row, column, row_span, column_span) == (1, 0, 1, 1)
@@ -1151,6 +1153,80 @@ def test_home_desktop_system_info_spans_full_width(app_ctx):
     finally:
         page.deleteLater()
         app.processEvents()
+
+
+def test_home_recent_tasks_has_fixed_height_and_limit(app_ctx):
+    """首页仅保留固定数量的最近任务，完整历史由历史页承载。"""
+    from types import SimpleNamespace
+    from gui_qt.components.recent_tasks_table import (
+        RECENT_TASK_LIMIT, RECENT_TASKS_HEIGHT)
+    from gui_qt.pages.home_page import HomePage
+
+    app, win, services = app_ctx
+    tasks = [SimpleNamespace(
+        task_id=str(index), state="success", created_at=index,
+        file_path=f"{index}.png", name=f"task-{index}", output_path="out.jpg")
+        for index in range(RECENT_TASK_LIMIT + 3)]
+    services.task_manager.all_tasks = lambda: tasks
+    page = HomePage(win, services)
+    try:
+        assert page.recent_tasks.height() == RECENT_TASKS_HEIGHT
+        assert len(page.recent_tasks._rows) == RECENT_TASK_LIMIT
+    finally:
+        page.deleteLater()
+        app.processEvents()
+
+
+def test_home_preset_explains_parameters_and_opens_matching_tool(monkeypatch):
+    """首页预设应说明用途，点击后应用参数并进入对应工具。"""
+    from types import SimpleNamespace
+    from gui_qt.components import toast
+    from gui_qt.pages.home_page import (
+        HomePage, _preset_summary, _preset_target, _preset_tool_label)
+
+    panels = {"video": {
+        "fmt": "mp4", "codec": "H.264", "res": "1920x1080"}}
+    assert _preset_target(panels)[0] == "video"
+    assert _preset_tool_label("video") == "视频转换"
+    assert _preset_summary(panels["video"]) == "MP4 · H.264 · 1920x1080"
+
+    applied = []
+    opened = []
+    messages = []
+    video_page = SimpleNamespace(apply_prefs=lambda prefs: applied.append(prefs))
+    home = SimpleNamespace(
+        saved_presets=SimpleNamespace(
+            store=SimpleNamespace(load=lambda _name: panels)),
+        main_window=SimpleNamespace(pages={"video": video_page}),
+        _nav_to=lambda key: opened.append(key))
+    monkeypatch.setattr(
+        toast, "show_success", lambda _parent, message: messages.append(message))
+
+    HomePage._apply_saved_preset(home, "1080P MP4")
+
+    assert applied == [panels["video"]]
+    assert opened == ["video"]
+    assert messages and "请选择文件" in messages[-1]
+
+
+def test_home_manage_presets_opens_exact_settings_section():
+    """首页管理按钮应直达转换预设，而不是停在设置首页。"""
+    from types import SimpleNamespace
+    from gui_qt.pages.home_page import HomePage
+
+    selected = []
+    opened = []
+    settings = SimpleNamespace(section_tabs=SimpleNamespace(
+        setCurrentTab=lambda key: selected.append(key)))
+    wrapper = SimpleNamespace(_ensure=lambda: settings)
+    home = SimpleNamespace(main_window=SimpleNamespace(
+        pages={"settings": wrapper},
+        switchTo=lambda page: opened.append(page)))
+
+    HomePage._open_preset_settings(home)
+
+    assert selected == ["presets"]
+    assert opened == [wrapper]
 
 
 def test_light_navigation_selected_text_has_explicit_contrast(monkeypatch):

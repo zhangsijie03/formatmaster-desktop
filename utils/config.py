@@ -9,7 +9,7 @@ import time as _time_mod
 from enum import Enum
 
 APP_NAME = tr("格式大师", "FormatMaster")
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.5.0-beta.1"
 # Display text is localized, but filesystem paths must remain stable across
 # language changes; otherwise preferences and downloaded tools appear to
 # disappear when the user switches between Chinese and English.

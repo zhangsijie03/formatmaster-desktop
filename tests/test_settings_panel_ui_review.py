@@ -126,6 +126,30 @@ def test_save_selects_new_preset_and_blocks_dialog_reentry(page, monkeypatch):
     assert not page._preset_busy and page.card_save_preset.isEnabled()
 
 
+def test_save_preset_only_collects_most_recent_tool(page, monkeypatch):
+    open_presets(page)
+    collected = []
+    page.main_window._last_tool_page_key = "audio"
+    page.main_window.pages = {
+        "video": SimpleNamespace(
+            panel_key="video",
+            collect_prefs=lambda: pytest.fail("unrelated tool collected")),
+        "audio": SimpleNamespace(
+            panel_key="audio",
+            collect_prefs=lambda: collected.append("audio") or {
+                "fmt": "mp3", "br": "320k"}),
+    }
+    monkeypatch.setattr(
+        "gui_qt.pages.settings_page.QInputDialog.getText",
+        lambda *args: ("podcast", True))
+
+    page._save_preset()
+
+    assert collected == ["audio"]
+    assert page.preset_store.data["podcast"] == {
+        "audio": {"fmt": "mp3", "br": "320k"}}
+
+
 @pytest.mark.parametrize("confirmed", [False, True])
 def test_same_name_overwrite_requires_confirmation(page, monkeypatch, confirmed):
     open_presets(page)
@@ -154,6 +178,7 @@ def test_empty_or_incomplete_snapshot_is_not_saved(page, monkeypatch):
         "video": SimpleNamespace(panel_key="video", collect_prefs=lambda: {"format": "mp4"}),
         "audio": SimpleNamespace(panel_key="audio", collect_prefs=fail),
     }
+    page.main_window._last_tool_page_key = "audio"
     page._save_preset()
     assert not page.preset_store.saved and not page._preset_busy
 
@@ -189,9 +214,13 @@ def test_apply_updates_panel_once_and_preserves_selection(page):
         page._apply_preset()
         applied.append(params)
 
-    page.main_window.pages = {"video": SimpleNamespace(panel_key="video", apply_prefs=apply)}
+    target_page = SimpleNamespace(panel_key="video", apply_prefs=apply)
+    opened = []
+    page.main_window.pages = {"video": target_page}
+    page.main_window.switchTo = lambda target: opened.append(target)
     page._apply_preset()
     assert applied == [{"format": "mp4"}]
+    assert opened == [target_page]
     assert page.cb_preset.currentText() == "one"
     assert not page._preset_busy
 

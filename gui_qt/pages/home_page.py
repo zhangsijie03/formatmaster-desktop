@@ -15,10 +15,51 @@ from qfluentwidgets import (CaptionLabel, FluentIcon, IconWidget,
 from gui_qt.components import design_system as ds
 from gui_qt.components.card import Card
 from gui_qt.components.quick_function_row import QuickFunctionRow
-from gui_qt.components.recent_tasks_table import RecentTasksTable
+from gui_qt.components.recent_tasks_table import (
+    RECENT_TASK_LIMIT, RECENT_TASKS_HEIGHT, RecentTasksTable)
 from gui_qt.components.tool_status_card import ToolStatusCard
 from gui_qt.components.system_info_card import SystemInfoCard
 from utils.panel_presets import PanelPresetStore
+
+
+RUNTIME_STATUS_HEIGHT = 260
+RUNTIME_STATUS_COMPACT_HEIGHT = 500
+
+_PRESET_SUMMARY_KEYS = (
+    "fmt", "codec", "res", "quality", "size", "br", "sr", "ch",
+    "preset", "mode")
+
+
+def _preset_target(panels):
+    """新预设只有一个工具；旧多工具预设兼容取首个有效项。"""
+    if not isinstance(panels, dict):
+        return "", {}
+    for key, prefs in panels.items():
+        if isinstance(key, str) and isinstance(prefs, dict):
+            return key, prefs
+    return "", {}
+
+
+def _preset_tool_label(panel_key):
+    from gui_qt.nav_registry import find_item, label
+    item = find_item(panel_key)
+    return label(item) if item else panel_key
+
+
+def _preset_summary(prefs):
+    """从不同工具的参数快照中提取最多三个可辨识的关键值。"""
+    values = []
+    for key in _PRESET_SUMMARY_KEYS:
+        value = prefs.get(key) if isinstance(prefs, dict) else None
+        if value is None or isinstance(value, bool):
+            continue
+        text = str(value).strip()
+        if not text or text in values:
+            continue
+        values.append(text.upper() if key == "fmt" else text)
+        if len(values) == 3:
+            break
+    return " · ".join(values) or tr("已保存工具参数", "Saved tool settings")
 
 
 class SavedPresetsCard(Card):
@@ -30,7 +71,7 @@ class SavedPresetsCard(Card):
     def __init__(self, parent=None):
         super().__init__(parent, radius=12)
         self.store = PanelPresetStore()
-        self.setMinimumHeight(230)
+        self.setFixedHeight(RECENT_TASKS_HEIGHT)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 12)
@@ -42,7 +83,8 @@ class SavedPresetsCard(Card):
         root.addWidget(title)
 
         hint = CaptionLabel(
-            tr("一键恢复常用参数组合", "Restore a saved parameter set"), self)
+            tr("点击应用参数并打开对应工具",
+               "Apply settings and open the matching tool"), self)
         hint.setStyleSheet(
             f"color: {ds.ink_sec()}; border: none; background: transparent;")
         root.addWidget(hint)
@@ -79,10 +121,17 @@ class SavedPresetsCard(Card):
             return
 
         for name in names:
-            button = PushButton(FluentIcon.LIBRARY, name, self.content)
-            button.setMinimumHeight(36)
+            panels = self.store.load(name)
+            panel_key, prefs = _preset_target(panels)
+            tool = _preset_tool_label(panel_key) if panel_key else tr(
+                "未知工具", "Unknown tool")
+            button = PushButton(
+                FluentIcon.LIBRARY,
+                f"{name} · {tool}\n{_preset_summary(prefs)}", self.content)
+            button.setFixedHeight(44)
             button.setAccessibleName(
-                tr("应用预设：{}", "Apply preset: {}").format(name))
+                tr("应用预设并打开{}：{}",
+                   "Apply preset and open {}: {}").format(tool, name))
             button.clicked.connect(
                 lambda checked=False, preset=name: self.preset_selected.emit(preset))
             self.content_layout.addWidget(button)
@@ -150,7 +199,6 @@ class HomePage(QWidget):
         self.workspace_grid.setVerticalSpacing(14)
 
         self.recent_tasks = RecentTasksTable(self.workspace)
-        self.recent_tasks.setMinimumHeight(230)
         self.recent_tasks.btn_history.clicked.connect(
             lambda: self._nav_to("history"))
         self.recent_tasks.btn_clear.clicked.connect(self._clear_tasks)
@@ -158,16 +206,16 @@ class HomePage(QWidget):
 
         self.saved_presets = SavedPresetsCard(self.workspace)
         self.saved_presets.preset_selected.connect(self._apply_saved_preset)
-        self.saved_presets.manage_requested.connect(
-            lambda: self._nav_to("settings"))
+        self.saved_presets.manage_requested.connect(self._open_preset_settings)
 
         self._workspace_compact = None
         self._relayout_workspace(False)
         v.addWidget(self.workspace)
 
-    # ── 默认折叠的运行环境 ───────────────────────
+    # ── 固定展示的运行环境 ───────────────────────
     def _build_environment(self, v):
         self.environment_card = Card(self, radius=12)
+        self.environment_card.setFixedHeight(RUNTIME_STATUS_HEIGHT)
         outer = QVBoxLayout(self.environment_card)
         outer.setContentsMargins(16, 12, 16, 12)
         outer.setSpacing(12)
@@ -185,11 +233,6 @@ class HomePage(QWidget):
             f"color: {ds.ink_sec()}; border: none; background: transparent;")
         header.addWidget(self.environment_summary)
         header.addStretch(1)
-        self.btn_environment = PushButton(
-            tr("诊断详情", "Diagnostics"), self.environment_card)
-        self.btn_environment.setCheckable(True)
-        self.btn_environment.toggled.connect(self._toggle_environment)
-        header.addWidget(self.btn_environment)
         outer.addLayout(header)
 
         self.environment_content = QWidget(self.environment_card)
@@ -202,7 +245,6 @@ class HomePage(QWidget):
         self.sysinfo = SystemInfoCard()
         self._main_compact = None
         self._relayout_main(False)
-        self.environment_content.hide()
         outer.addWidget(self.environment_content)
         v.addWidget(self.environment_card)
         self._refresh_status_summary()
@@ -231,26 +273,21 @@ class HomePage(QWidget):
         self.main_grid.removeWidget(self.tool_status)
         self.main_grid.removeWidget(self.sysinfo)
         if compact:
+            self.environment_card.setFixedHeight(
+                RUNTIME_STATUS_COMPACT_HEIGHT)
             self.main_grid.addWidget(self.tool_status, 0, 0, Qt.AlignTop)
             self.main_grid.addWidget(self.sysinfo, 1, 0, Qt.AlignTop)
             self.sysinfo.set_horizontal(False)
             self.main_grid.setColumnStretch(0, 1)
             self.main_grid.setColumnStretch(1, 0)
         else:
+            self.environment_card.setFixedHeight(RUNTIME_STATUS_HEIGHT)
             self.main_grid.addWidget(self.tool_status, 0, 0, Qt.AlignTop)
             self.main_grid.addWidget(self.sysinfo, 0, 1, Qt.AlignTop)
-            self.sysinfo.set_horizontal(False)
+            # 宽屏压缩为 3×2 摘要，固定高度内仍完整露出最底一行。
+            self.sysinfo.set_horizontal(True)
             self.main_grid.setColumnStretch(0, 3)
             self.main_grid.setColumnStretch(1, 7)
-
-    def _toggle_environment(self, expanded):
-        """诊断信息按需展开，避免长期占据首页主任务区域。"""
-        self.environment_content.setVisible(expanded)
-        self.btn_environment.setText(
-            tr("收起", "Hide details") if expanded
-            else tr("诊断详情", "Diagnostics"))
-        if expanded:
-            self._refresh_environment()
 
     def resizeEvent(self, event):
         """信息块按可用宽度重排，保证窗口缩小时仍有清晰层级。"""
@@ -326,8 +363,19 @@ class HomePage(QWidget):
         real_page = page._ensure() if hasattr(page, "_ensure") else page
         real_page.open_plugin(plugin_id, self.window())
 
+    def _open_preset_settings(self):
+        """“管理预设”直达设置中的预设分区，避免用户再次寻找入口。"""
+        page = self.main_window.pages.get("settings")
+        if page is None:
+            return
+        real_page = page._ensure() if hasattr(page, "_ensure") else page
+        section_tabs = getattr(real_page, "section_tabs", None)
+        if section_tabs is not None:
+            section_tabs.setCurrentTab("presets")
+        self.main_window.switchTo(page)
+
     def _apply_saved_preset(self, name):
-        """只实例化预设实际包含的面板，再批量恢复其参数。"""
+        """恢复预设后进入对应工具，让用户直接选择文件并开始处理。"""
         from gui_qt.components import toast
 
         panels = self.saved_presets.store.load(name)
@@ -339,6 +387,7 @@ class HomePage(QWidget):
 
         applied = 0
         failed = 0
+        target_key, _target_prefs = _preset_target(panels)
         for panel_key, prefs in panels.items():
             page = self.main_window.pages.get(panel_key)
             if page is None:
@@ -352,13 +401,19 @@ class HomePage(QWidget):
                 applied += 1
             except Exception:  # noqa: BLE001 - 单个面板失败不影响其余预设
                 failed += 1
+        if applied and target_key:
+            self._nav_to(target_key)
         if failed:
             toast.show_warning(
                 self, tr("已应用 {} 个工具，{} 个失败",
                          "Applied to {} tools; {} failed").format(applied, failed))
             return
-        toast.show_success(
-            self, tr("已应用预设：{}", "Preset applied: {}").format(name))
+        tool = _preset_tool_label(target_key) if target_key else tr(
+            "对应工具", "the matching tool")
+        toast.show_success(self, tr(
+            "已应用“{}”并打开{}，请选择文件。",
+            'Applied "{}" and opened {}. Choose a file to continue.').format(
+                name, tool))
 
     # ── 首页「最近任务」进行中数徽章（InfoBadge）──
     def _wire_task_badge(self):
@@ -427,7 +482,7 @@ class HomePage(QWidget):
     def _refresh_tasks(self):
         try:
             all_tasks = self.services.task_manager.all_tasks()
-            tasks = all_tasks[:6]
+            tasks = all_tasks[:RECENT_TASK_LIMIT]
         except Exception:
             all_tasks = []
             tasks = []
@@ -438,10 +493,8 @@ class HomePage(QWidget):
 
     def showEvent(self, e):
         self._refresh_all()
-        # 运行环境默认折叠；只有用户主动展开后才刷新诊断数据，避免首页
-        # 每次显示都执行与当前任务无关的系统探测。
-        if self.btn_environment.isChecked():
-            self._refresh_environment()
+        # 状态区始终可见；显示首页时刷新，异步探测不会阻塞主界面。
+        self._refresh_environment()
         super().showEvent(e)
 
     def _refresh_environment(self):
@@ -454,7 +507,7 @@ class HomePage(QWidget):
             pass
 
     def _refresh_status_summary(self, ffmpeg_ready=None):
-        """折叠状态栏只展示关键结论，详细探测仍由用户主动触发。"""
+        """状态栏头部展示关键结论，详细信息固定显示在下方。"""
         output_dir = getattr(self.services, "last_output_dir", "") or ""
         output_text = (os.path.basename(output_dir.rstrip(os.sep))
                        if output_dir else tr("跟随工具设置", "per-tool setting"))

@@ -25,6 +25,10 @@ _STATE_STYLE = {
 }
 _DEFAULT = ("#9BA1B4", tr("未知", "Unknown"))
 
+# 首页只承担快速回看职责；完整列表统一从“转换历史”进入。
+RECENT_TASK_LIMIT = 5
+RECENT_TASKS_HEIGHT = 300
+
 
 def _fmt_ext(task):
     """从输出路径推断目标格式（大写，无点）。"""
@@ -54,6 +58,7 @@ class RecentTasksTable(Card):
 
     def __init__(self, parent=None):
         super().__init__(parent, radius=12)
+        self.setFixedHeight(RECENT_TASKS_HEIGHT)
         self._rows = []
         self._empty_widget = None
         self._last_sig = None   # 上次渲染的任务快照指纹（去重，切页不重建）
@@ -140,7 +145,8 @@ class RecentTasksTable(Card):
         # 去重：任务集合未变化（id/状态/时间戳一致）时不重建控件。
         # 首页 showEvent 每次切回都会调用，之前无脑重建 6 行 widget
         # （每行 ~8 个 QWidget/QLabel）→ 切页卡顿源之一。
-        sig = [(t.task_id, t.state, t.created_at) for t in tasks[:6]]
+        visible_tasks = tasks[:RECENT_TASK_LIMIT]
+        sig = [(t.task_id, t.state, t.created_at) for t in visible_tasks]
         if sig == self._last_sig:
             return
         self._last_sig = sig
@@ -149,7 +155,7 @@ class RecentTasksTable(Card):
             self._empty_widget = self._empty_hint()
             self.list_box.addWidget(self._empty_widget)
             return
-        for task in tasks[:6]:
+        for task in visible_tasks:
             row = _TaskTableRow(task, self)
             self._rows.append(row)
             self.list_box.addWidget(row)
