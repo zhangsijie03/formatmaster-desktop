@@ -66,8 +66,8 @@ def test_unsigned_macos_fallback_is_explicit_and_clearly_labeled():
     assert "startsWith(github.ref_name, 'build-macos-v1.0.0-')" in text
     assert "github.ref_name || env.RELEASE_TAG" in text
     assert "type: boolean" in text
-    assert "startsWith(github.ref_name, 'build-macos-v1.0.0-') || inputs.unsigned_macos" in text
-    assert "!startsWith(github.ref_name, 'build-macos-v1.0.0-') && !inputs.unsigned_macos" in text
+    assert "contains(env.RELEASE_TAG, '-') || startsWith(github.ref_name, 'build-macos-v1.0.0-') || inputs.unsigned_macos" in text
+    assert "!contains(env.RELEASE_TAG, '-') && !startsWith(github.ref_name, 'build-macos-v1.0.0-') && !inputs.unsigned_macos" in text
     assert "MACOS_FFMPEG_LICENSE_SHA256" in text
     assert "COPYING.GPLv3" in text
     assert "Signature=adhoc" in text
@@ -82,7 +82,7 @@ def test_release_workflow_publishes_checksums_and_assets():
     assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in text
     assert "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093" in text
     assert "name '*.dmg'" in text
-    assert "windows-x64-portable.zip" in text
+    assert "windows-x64-portable*.zip" in text
     assert "*.spdx.json" in text
     assert "attestations: write" in text
     assert "contents: write" in text
@@ -115,6 +115,18 @@ def test_public_distribution_requires_platform_signing():
     assert "WINDOWS_CERTIFICATE_PFX_BASE64" in text
     assert 'grep -F "Authority=Developer ID Application"' in text
     assert "$signtool.FullName verify /pa /v" in text
+    assert "if: ${{ !contains(env.RELEASE_TAG, '-') }}" in text
+
+
+def test_prerelease_assets_are_explicitly_marked_unsigned():
+    text = _workflow_text()
+    assert 'PYTHONUTF8: "1"' in text
+    assert '$env:RELEASE_TAG.Contains("-")' in text
+    assert 'windows-x64-portable$suffix.zip' in text
+    assert '*-windows-x64-portable*.zip' in text
+    assert 'SUFFIX="-unsigned"' in text
+    assert 'macOS-arm64${SUFFIX}.dmg' in text
+    assert 'windows-x64-portable${SUFFIX}.zip' in text
 
 
 def test_release_workflow_uses_robust_windows_onedir_zip():
@@ -135,9 +147,9 @@ def test_release_workflow_uses_robust_windows_onedir_zip():
 
 def test_release_workflow_requires_complete_asset_set_and_notes():
     text = _workflow_text()
-    assert 'test -f "FormatMaster-${VERSION}-macOS-arm64.dmg"' in text
-    assert 'test -f "FormatMaster-${VERSION}-macOS-x86_64.dmg"' in text
-    assert 'test -f "FormatMaster-${VERSION}-windows-x64-portable.zip"' in text
+    assert 'test -f "FormatMaster-${VERSION}-macOS-arm64${SUFFIX}.dmg"' in text
+    assert 'test -f "FormatMaster-${VERSION}-macOS-x86_64${SUFFIX}.dmg"' in text
+    assert 'test -f "FormatMaster-${VERSION}-windows-x64-portable${SUFFIX}.zip"' in text
     assert 'NOTES="docs/releases/${RELEASE_TAG}.md"' in text
     assert "Automated multi-platform release" not in text
 

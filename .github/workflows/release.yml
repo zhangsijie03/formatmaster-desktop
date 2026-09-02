@@ -26,6 +26,7 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.11"
+  PYTHONUTF8: "1"
   RELEASE_TAG: ${{ startsWith(github.ref_name, 'build-macos-v1.0.0-') && 'v1.0.0' || (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name) }}
   YTDLP_VERSION: "2026.08.19"
   YTDLP_MACOS_SHA256: "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202"
@@ -151,7 +152,7 @@ jobs:
             --sbom "$RUNNER_TEMP/FormatMaster-${RELEASE_TAG#v}-macOS-${{ matrix.arch }}.spdx.json"
 
       - name: 校验 macOS 正式签名配置
-        if: ${{ !startsWith(github.ref_name, 'build-macos-v1.0.0-') && !inputs.unsigned_macos }}
+        if: ${{ !contains(env.RELEASE_TAG, '-') && !startsWith(github.ref_name, 'build-macos-v1.0.0-') && !inputs.unsigned_macos }}
         env:
           MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -168,7 +169,7 @@ jobs:
           test -n "$APPLE_APP_PASSWORD"
 
       - name: 安装 Developer ID 证书
-        if: ${{ !startsWith(github.ref_name, 'build-macos-v1.0.0-') && !inputs.unsigned_macos }}
+        if: ${{ !contains(env.RELEASE_TAG, '-') && !startsWith(github.ref_name, 'build-macos-v1.0.0-') && !inputs.unsigned_macos }}
         env:
           CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -192,7 +193,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: 配置 Apple notarization
-        if: ${{ !startsWith(github.ref_name, 'build-macos-v1.0.0-') && !inputs.unsigned_macos }}
+        if: ${{ !contains(env.RELEASE_TAG, '-') && !startsWith(github.ref_name, 'build-macos-v1.0.0-') && !inputs.unsigned_macos }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -209,7 +210,7 @@ jobs:
         env:
           FORMATMASTER_DIST: ${{ runner.temp }}/formatmaster-dist
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-          ALLOW_UNSIGNED_MACOS: ${{ startsWith(github.ref_name, 'build-macos-v1.0.0-') || inputs.unsigned_macos }}
+          ALLOW_UNSIGNED_MACOS: ${{ contains(env.RELEASE_TAG, '-') || startsWith(github.ref_name, 'build-macos-v1.0.0-') || inputs.unsigned_macos }}
         run: |
           if [ "$ALLOW_UNSIGNED_MACOS" = "true" ]; then
             # 兜底包使用 build.py 内置的 ad-hoc 签名，并在文件名中明确标识。
@@ -229,7 +230,7 @@ jobs:
       - name: 验证 DMG 并重命名
         env:
           FORMATMASTER_DIST: ${{ runner.temp }}/formatmaster-dist
-          ALLOW_UNSIGNED_MACOS: ${{ startsWith(github.ref_name, 'build-macos-v1.0.0-') || inputs.unsigned_macos }}
+          ALLOW_UNSIGNED_MACOS: ${{ contains(env.RELEASE_TAG, '-') || startsWith(github.ref_name, 'build-macos-v1.0.0-') || inputs.unsigned_macos }}
         run: |
           DMG="$FORMATMASTER_DIST/格式大师-macOS.dmg"
           VERSION="${RELEASE_TAG#v}"
@@ -391,6 +392,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: 签名并验证 Windows 主程序
+        if: ${{ !contains(env.RELEASE_TAG, '-') }}
         shell: pwsh
         env:
           CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
@@ -437,7 +439,9 @@ jobs:
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item $appDir "$stage\格式大师" -Recurse -Force
           Copy-Item LICENSE, NOTICE, PRIVACY.md, SECURITY.md, THIRD_PARTY_NOTICES.md, THIRD_PARTY_LICENSES.md $stage -Force
-          $archive = Join-Path $env:RUNNER_TEMP "FormatMaster-$version-windows-x64-portable.zip"
+          # 预发布允许测试未签名构建，但必须在公开文件名中明确标识。
+          $suffix = if ($env:RELEASE_TAG.Contains("-")) { "-unsigned" } else { "" }
+          $archive = Join-Path $env:RUNNER_TEMP "FormatMaster-$version-windows-x64-portable$suffix.zip"
           Compress-Archive -Path "$stage\*" -DestinationPath $archive -Force
           if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
             throw "Windows ZIP 未生成：$archive"
@@ -448,7 +452,7 @@ jobs:
         with:
           name: FormatMaster-windows-x64
           path: |
-            ${{ runner.temp }}/FormatMaster-*-windows-x64-portable.zip
+            ${{ runner.temp }}/FormatMaster-*-windows-x64-portable*.zip
             ${{ runner.temp }}/FormatMaster-*-windows-x64.spdx.json
           if-no-files-found: error
 
@@ -476,12 +480,16 @@ jobs:
         run: |
           mkdir -p release-assets-flat
           # 诊断 artifact 只用于排障，禁止混入公开 Release 资产和校验文件。
-          find release-assets -type f \( -name '*.dmg' -o -name '*-windows-x64-portable.zip' -o -name '*.spdx.json' \) -exec cp {} release-assets-flat/ \;
+          find release-assets -type f \( -name '*.dmg' -o -name '*-windows-x64-portable*.zip' -o -name '*.spdx.json' \) -exec cp {} release-assets-flat/ \;
           cd release-assets-flat
           VERSION="${RELEASE_TAG#v}"
-          test -f "FormatMaster-${VERSION}-macOS-arm64.dmg"
-          test -f "FormatMaster-${VERSION}-macOS-x86_64.dmg"
-          test -f "FormatMaster-${VERSION}-windows-x64-portable.zip"
+          SUFFIX=""
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            SUFFIX="-unsigned"
+          fi
+          test -f "FormatMaster-${VERSION}-macOS-arm64${SUFFIX}.dmg"
+          test -f "FormatMaster-${VERSION}-macOS-x86_64${SUFFIX}.dmg"
+          test -f "FormatMaster-${VERSION}-windows-x64-portable${SUFFIX}.zip"
           test -f "FormatMaster-${VERSION}-macOS-arm64.spdx.json"
           test -f "FormatMaster-${VERSION}-macOS-x86_64.spdx.json"
           test -f "FormatMaster-${VERSION}-windows-x64.spdx.json"

@@ -145,7 +145,9 @@ def main() -> int:
     _write_licenses(args.licenses, packages)
     if args.sbom:
         _write_sbom(args.sbom, packages)
-    print(f"已记录 {len(packages)} 个当前平台运行时依赖")
+    # GitHub 的 Windows runner 可能仍使用非 UTF-8 控制台，避免合规产物
+    # 已生成后仅因状态消息编码失败而中断发布。
+    print(f"Recorded {len(packages)} installed runtime dependencies")
     return 0
 
 
